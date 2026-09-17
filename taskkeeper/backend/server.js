@@ -1,0 +1,634 @@
+// Task Keeper backend — v2
+// Express + JSON-file storage, hardened with security headers, rate limiting
+// and strict input validation. Adds Web Push (VAPID) so reminders reach the
+// phone/desktop even when the browser tab is closed, plus a built-in scheduler
+// that pushes notifications at each reminder time while the server is running.
+
+const express = require("express");
+const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const webpush = require("web-push");
+
+const PORT = process.env.PORT || 4000;
+const DATA_DIR = path.join(__dirname, "data");
+const DATA_FILE = path.join(DATA_DIR, "tasks.json");
+const SUBS_FILE = path.join(DATA_DIR, "subscriptions.json");
+const VAPID_FILE = path.join(DATA_DIR, "vapid.json");
+const FRONTEND_DIR = path.join(__dirname, "..", "frontend");
+const MAX_SUBSCRIPTIONS = Number(process.env.MAX_SUBSCRIPTIONS || 1000);
+
+const app = express();
+app.disable("x-powered-by");
+app.set("trust proxy", 1); // for rate limiting behind a reverse proxy
+
+// ---------- security middleware ----------
+
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+        fontSrc: ["'self'", "https://fonts.gstatic.com"],
+        imgSrc: ["'self'", "data:"],
+        connectSrc: ["'self'"],
+        objectSrc: ["'none'"],
+        baseUri: ["'self'"],
+        frameAncestors: ["'none'"],
+        manifestSrc: ["'self'"],
+        workerSrc: ["'self'"],
+      },
+    },
+    crossOriginEmbedderPolicy: false,
+  })
+);
+
+app.use(cors({ origin: [/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/] }));
+app.use(express.json({ limit: "100kb" }));
+
+// Loose API-wide limiter + a strict one for subscription writes.
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 180,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests — please try again in a minute." },
+});
+const subscribeLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many subscription changes — please wait a minute." },
+});
+
+// Small request log (method, url, status, duration).
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on("finish", () => {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl} ${res.statusCode} (${Date.now() - start}ms)`);
+  });
+  next();
+});
+
+app.use("/api", apiLimiter);
+
+// ---------- storage helpers ----------
+
+function ensureStore() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, "[]", "utf8");
+  if (!fs.existsSync(SUBS_FILE)) fs.writeFileSync(SUBS_FILE, "[]", "utf8");
+}
+
+function readJson(file, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8") || "[]");
+  } catch (err) {
+    console.error(`Failed to read ${file}, starting fresh:`, err);
+    return fallback;
+  }
+}
+
+function writeJson(file, data) {
+  ensureStore();
+  fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf8");
+}
+
+function readTasks() {
+  return readJson(DATA_FILE, []);
+}
+
+function writeTasks(tasks) {
+  writeJson(DATA_FILE, tasks);
+}
+
+function readSubs() {
+  return readJson(SUBS_FILE, []);
+}
+
+function writeSubs(subs) {
+  writeJson(SUBS_FILE, subs);
+}
+
+// ---------- VAPID keys (Web Push) ----------
+
+function getVapidKeys() {
+  // 1. Environment variables win (great for hosted platforms).
+  if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
+    return { publicKey: process.env.VAPID_PUBLIC_KEY, privateKey: process.env.VAPID_PRIVATE_KEY };
+  }
+  // 2. Otherwise reuse or generate a keypair and persist it in data/.
+  if (fs.existsSync(VAPID_FILE)) {
+    try {
+      return JSON.parse(fs.readFileSync(VAPID_FILE, "utf8"));
+    } catch (err) {
+      /* fall through and regenerate */
+    }
+  }
+  const keys = webpush.generateVAPIDKeys();
+  ensureStore();
+  fs.writeFileSync(VAPID_FILE, JSON.stringify(keys, null, 2), "utf8");
+  console.log("Generated new VAPID keys for Web Push (saved to backend/data/vapid.json).");
+  return keys;
+}
+
+const vapidKeys = getVapidKeys();
+const VAPID_SUBJECT =
+  process.env.VAPID_SUBJECT || "mailto:taskkeeper@" + (require("os").hostname() || "localhost");
+webpush.setVapidDetails(VAPID_SUBJECT, vapidKeys.publicKey, vapidKeys.privateKey);
+
+// ---------- validation & time helpers ----------
+
+function isValidDate(str) {
+  return typeof str === "string" && /^\d{4}-\d{2}-\d{2}$/.test(str);
+}
+
+function isValidTime(str) {
+  return typeof str === "string" && /^([01]\d|2[0-3]):([0-5]\d)$/.test(str);
+}
+
+function toMinutes(hhmm) {
+  const [h, m] = hhmm.split(":").map(Number);
+  return h * 60 + m;
+}
+
+function to12h(hhmm) {
+  const [h, m] = hhmm.split(":").map(Number);
+  const period = h >= 12 ? "PM" : "AM";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:${String(m).padStart(2, "0")} ${period}`;
+}
+
+function formatDate(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function hhmmNow() {
+  const now = new Date();
+  return `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+}
+
+function computeReminders(startTime, endTime) {
+  const start = toMinutes(startTime);
+  const end = toMinutes(endTime);
+  if (end <= start) return [];
+  const midpoint = start + Math.floor((end - start) / 2);
+  const reminders = [];
+  for (let t = midpoint; t <= end; t += 15) {
+    const h = String(Math.floor(t / 60)).padStart(2, "0");
+    const m = String(t % 60).padStart(2, "0");
+    reminders.push(`${h}:${m}`);
+  }
+  if (reminders.length === 0) reminders.push(startTime);
+  return reminders;
+}
+
+function sanitizeNotes(notes) {
+  return typeof notes === "string" ? notes.slice(0, 1000).trim() : "";
+}
+
+// ---------- task model: time / snooze / repeat ----------
+
+const SNOOZE_OPTIONS = new Set([0, 3, 5, 10]);
+const REPEAT_MODES = new Set(["none", "daily", "weekly"]);
+// How many future instances a repeating task gets materialized into.
+const REPEAT_FORWARD_DAILY = Number(process.env.REPEAT_DAILY_DAYS || 60);
+const REPEAT_FORWARD_WEEKLY = Number(process.env.REPEAT_WEEKLY_WEEKS || 13);
+
+// Existing range tasks keep the old midpoint rule; new tasks with a single
+// `time` get a reminder at that time plus one extra at time+snoozeMinutes.
+function remindersForTask(time, startTime, endTime, snoozeMinutes) {
+  if (time && isValidTime(time)) {
+    const list = [time];
+    const snooze = Number(snoozeMinutes) || 0;
+    if (snooze > 0 && SNOOZE_OPTIONS.has(snooze)) {
+      const t = toMinutes(time) + snooze;
+      const h = String(Math.floor(t / 60)).padStart(2, "0");
+      const m = String(t % 60).padStart(2, "0");
+      list.push(`${h}:${m}`);
+    }
+    return list;
+  }
+  if (isValidTime(startTime) && isValidTime(endTime)) {
+    return computeReminders(startTime, endTime);
+  }
+  return []; // no time set — checklist-only item
+}
+
+function buildTask(fields) {
+  const task = {
+    id: crypto.randomUUID(),
+    date: fields.date,
+    title: fields.title.trim(),
+    notes: sanitizeNotes(fields.notes),
+    time: fields.time && isValidTime(fields.time) ? fields.time : null,
+    startTime: fields.startTime && isValidTime(fields.startTime) ? fields.startTime : null,
+    endTime: fields.endTime && isValidTime(fields.endTime) ? fields.endTime : null,
+    snoozeMinutes: Number(fields.snoozeMinutes) || 0,
+    repeat: REPEAT_MODES.has(fields.repeat) ? fields.repeat : "none",
+    reminders: [],
+    createdAt: new Date().toISOString(),
+  };
+  task.reminders = remindersForTask(task.time, task.startTime, task.endTime, task.snoozeMinutes);
+  return task;
+}
+
+// For daily/weekly repeat, materialize future copies so the mini-calendar shows
+// them, the scheduler pushes them, and past days keep their history.
+function futureDates(dateStr, repeat, maxInstances) {
+  const out = [];
+  if (repeat !== "daily" && repeat !== "weekly") return out;
+  const step = repeat === "daily" ? 1 : 7;
+  const d = new Date(dateStr + "T00:00:00");
+  d.setDate(d.getDate() + step);
+  const cap = new Date(d.getTime() + 400 * 86400000).getTime();
+  for (let i = 0; i < maxInstances && d.getTime() <= cap; i++) {
+    out.push(formatDate(d));
+    d.setDate(d.getDate() + step);
+  }
+  return out;
+}
+
+// ---------- Web Push: subscriptions + reminder scheduler ----------
+
+function removeSubscription(endpoint) {
+  writeSubs(readSubs().filter((s) => s.endpoint !== endpoint));
+}
+
+function sendPush(task, time, subs) {
+  // Time-only tasks have no startTime/endTime — build the text from the
+  // effective event time so we never touch null values.
+  const eventTime = task.time || task.startTime;
+  const isRange = task.startTime && task.endTime;
+  const whenText = isRange
+    ? `${to12h(task.startTime)}–${to12h(task.endTime)}`
+    : eventTime
+      ? `${to12h(eventTime)}${task.snoozeMinutes ? ` · snooze +${task.snoozeMinutes}m` : ""}`
+      : "Anytime";
+  const payload = {
+    title: task.title,
+    body: `${whenText} · Reminder for ${to12h(time)}`,
+    tag: `${task.id}|${task.date}|${time}`,
+    icon: "/icons/icon-192.png",
+    badge: "/icons/icon-192.png",
+    id: task.id,
+    date: task.date,
+    time,
+    startTime: task.startTime || null,
+    endTime: task.endTime || null,
+  };
+  const json = JSON.stringify(payload);
+  let failed = 0;
+  for (const sub of subs) {
+    webpush.sendNotification(sub, json).catch((err) => {
+      failed += 1;
+      const code = err && err.statusCode ? err.statusCode : 0;
+      if (code === 404 || code === 410) {
+        // Gone / no longer valid — drop this device.
+        console.log("Removing stale push subscription:", sub.endpoint);
+        removeSubscription(sub.endpoint);
+      } else if (code === 429 || code === 500) {
+        console.error(`Push rate-limited/server error (${code}), will retry later.`);
+      } else if (code) {
+        console.error(`Push failed (${code}) for ${sub.endpoint}`);
+      } else {
+        console.error("Push failed:", err.message);
+      }
+    });
+  }
+  return { total: subs.length, failed };
+}
+
+// Each device can live in a different timezone (a cloud server runs in UTC;
+// the user may be in IST/CEST/PST...). We store the device's UTC offset in
+// minutes with its subscription and evaluate reminders per offset group.
+// Server-local UTC offset (in minutes). Subscriptions created before the
+// timezone feature had no stored offset; for those, use the server's own
+// timezone — which is correct when the server runs on the same device/location
+// as the user (like this dev setup).
+const SERVER_UTC_OFFSET_MINUTES = -new Date().getTimezoneOffset();
+
+function offsetOf(sub) {
+  const n = Number(sub && sub.utcOffsetMinutes);
+  return Number.isInteger(n) && n >= -840 && n <= 840 ? n : SERVER_UTC_OFFSET_MINUTES;
+}
+
+// "What time and date is it at UTC offset `offset` minutes from nowMs?"
+// Independent of the server's own timezone: `nowMs + offset*60000` marks that
+// instant in UTC, so its UTC clock-fields ARE the local clock at that offset.
+function clockAtOffset(nowMs, offset) {
+  const d = new Date(nowMs + Number(offset) * 60000);
+  const pad = (n) => String(n).padStart(2, "0");
+  return {
+    date: `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`,
+    hhmm: `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`,
+  };
+}
+
+function checkDueReminders() {
+  const tasks = readTasks();
+  const subs = readSubs();
+  const nowMs = Date.now();
+
+  // If there are no subscribers yet, still check using UTC+0 so the log shows
+  // the scheduler running; real devices adjust to their own offset.
+  const offsets = [...new Set(subs.length ? subs.map(offsetOf) : [SERVER_UTC_OFFSET_MINUTES])];
+  let touched = false;
+
+  for (const offset of offsets) {
+    const { date: today, hhmm: nowHHMM } = clockAtOffset(nowMs, offset);
+
+    const due = tasks.filter(
+      (t) =>
+        t.date === today &&
+        !t.done &&
+        Array.isArray(t.reminders) &&
+        t.reminders.includes(nowHHMM) &&
+        !(Array.isArray(t.pushedTimes) && t.pushedTimes.includes(nowHHMM))
+    );
+
+    if (due.length === 0) continue;
+
+    const groupSubs = subs.filter((s) => offsetOf(s) === offset);
+    const sign = offset >= 0 ? "+" : "";
+    console.log(`[reminders] ${today} ${nowHHMM} (UTC${sign}${offset}): ${due.length} task(s) due, ${groupSubs.length} subscriber(s)`);
+
+    for (const task of due) {
+      try {
+        const { total, failed } = sendPush(task, nowHHMM, groupSubs);
+        if (total > 0) {
+          console.log(`[reminders] pushed "${task.title}" for ${nowHHMM} to ${total} device(s), ${failed} failed`);
+        } else {
+          console.log(`[reminders] "${task.title}" due at ${nowHHMM} — no subscribers yet. Install the app / enable notifications.`);
+        }
+      } catch (err) {
+        console.error(`[reminders] push failed for task ${task.id}:`, err && err.message ? err.message : err);
+      } finally {
+        // Always mark the reminder as handled so a single failure can't cause
+        // repeated spam on every scheduler tick.
+        task.pushedTimes = [...(task.pushedTimes || []), nowHHMM];
+        touched = true;
+      }
+    }
+  }
+
+  if (touched) writeTasks(tasks);
+}
+
+const PUSH_INTERVAL_MS = Number(process.env.PUSH_INTERVAL_MS || 15000);
+setInterval(() => {
+  try {
+    checkDueReminders();
+  } catch (err) {
+    console.error("Reminder scheduler error:", err);
+  }
+}, PUSH_INTERVAL_MS);
+
+// Public key so the browser can create a VAPID push subscription.
+app.get("/api/push/public-key", (req, res) => {
+  res.json({ publicKey: vapidKeys.publicKey });
+});
+
+// Register a push subscription (one per device/browser).
+app.post("/api/subscribe", subscribeLimiter, (req, res) => {
+  const body = req.body || {};
+  const endpoint = typeof body.endpoint === "string" ? body.endpoint.trim() : "";
+  const keys = body.keys && typeof body.keys === "object" ? body.keys : {};
+
+  if (!/^https:\/\/.+/.test(endpoint)) {
+    return res.status(400).json({ error: "endpoint must be a valid https push URL" });
+  }
+  if (typeof keys.p256dh !== "string" || !/^[A-Za-z0-9+/_-]{10,}=*$/.test(keys.p256dh)) {
+    return res.status(400).json({ error: "keys.p256dh must be a base64url key" });
+  }
+  if (typeof keys.auth !== "string" || !/^[A-Za-z0-9+/_-]{10,}=*$/.test(keys.auth)) {
+    return res.status(400).json({ error: "keys.auth must be a base64url key" });
+  }
+
+  let utcOffsetMinutes = 0;
+  if (body.utcOffsetMinutes !== undefined) {
+    const n = Number(body.utcOffsetMinutes);
+    if (!Number.isInteger(n) || n < -840 || n > 840) {
+      return res.status(400).json({ error: "utcOffsetMinutes must be an integer between -840 and 840" });
+    }
+    utcOffsetMinutes = n;
+  }
+
+  const subs = readSubs();
+  const existing = subs.find((s) => s.endpoint === endpoint);
+  if (existing) {
+    // Re-subscribing on a later app load: keep the device, but refresh its
+    // timezone offset and last-seen time (the user may have changed timezone).
+    if (body.utcOffsetMinutes !== undefined && body.utcOffsetMinutes !== null) {
+      existing.utcOffsetMinutes = Number(body.utcOffsetMinutes);
+    }
+    existing.lastSeenAt = new Date().toISOString();
+    writeSubs(subs);
+    return res.json({ ok: true, already: true, offsetUpdated: existing.utcOffsetMinutes });
+  }
+  if (subs.length >= MAX_SUBSCRIPTIONS) {
+    return res.status(400).json({ error: "subscription limit reached" });
+  }
+
+  subs.push({
+    endpoint,
+    expirationTime: typeof body.expirationTime === "string" && body.expirationTime ? body.expirationTime : null,
+    utcOffsetMinutes,
+    keys: { p256dh: keys.p256dh, auth: keys.auth },
+    createdAt: new Date().toISOString(),
+  });
+  writeSubs(subs);
+  res.status(201).json({ ok: true });
+});
+
+// Unregister a push subscription (called by the app when notifications are off).
+app.post("/api/unsubscribe", (req, res) => {
+  const endpoint = req.body && typeof req.body.endpoint === "string" ? req.body.endpoint.trim() : "";
+  if (!endpoint) return res.status(400).json({ error: "endpoint is required" });
+  removeSubscription(endpoint);
+  res.json({ ok: true });
+});
+
+// ---------- API routes: tasks ----------
+
+// List tasks. Optional ?date=YYYY-MM-DD to filter to one day.
+app.get("/api/tasks", (req, res) => {
+  const { date } = req.query;
+  let tasks = readTasks();
+  if (date) {
+    if (!isValidDate(date)) {
+      return res.status(400).json({ error: "date must be in YYYY-MM-DD format" });
+    }
+    tasks = tasks.filter((t) => t.date === date);
+  }
+  const timeOf = (t) => (t.time || t.startTime || "23:59");
+  tasks.sort((a, b) => timeOf(a).localeCompare(timeOf(b)));
+  res.json(tasks);
+});
+
+// Dates that have at least one task, with a count — used to mark the calendar.
+app.get("/api/tasks/summary", (req, res) => {
+  const tasks = readTasks();
+  const counts = {};
+  for (const t of tasks) counts[t.date] = (counts[t.date] || 0) + 1;
+  res.json(counts);
+});
+
+app.post("/api/tasks", (req, res) => {
+  const body = req.body || {};
+  const { date, title, time, startTime, endTime, notes, snoozeMinutes, repeat } = body;
+
+  if (!isValidDate(date)) {
+    return res.status(400).json({ error: "date is required as YYYY-MM-DD" });
+  }
+  if (typeof title !== "string" || !title.trim()) {
+    return res.status(400).json({ error: "title is required" });
+  }
+  if (title.trim().length > 120) {
+    return res.status(400).json({ error: "title must be 120 characters or fewer" });
+  }
+
+  const hasTime = time !== undefined && time !== null && time !== "";
+  if (hasTime && !isValidTime(time)) {
+    return res.status(400).json({ error: "time must be HH:MM" });
+  }
+  const hasRange = startTime !== undefined && startTime !== null && startTime !== "" && endTime;
+  if (hasRange && (!isValidTime(startTime) || !isValidTime(endTime))) {
+    return res.status(400).json({ error: "startTime/endTime must be HH:MM" });
+  }
+  if (hasRange && toMinutes(endTime) <= toMinutes(startTime)) {
+    return res.status(400).json({ error: "endTime must be after startTime" });
+  }
+  const snooze = snoozeMinutes === undefined || snoozeMinutes === null || snoozeMinutes === "" ? 0 : Number(snoozeMinutes);
+  if (!SNOOZE_OPTIONS.has(snooze)) {
+    return res.status(400).json({ error: "snoozeMinutes must be one of 0, 3, 5, 10" });
+  }
+  if (repeat !== undefined && repeat !== null && repeat !== "" && !REPEAT_MODES.has(repeat)) {
+    return res.status(400).json({ error: "repeat must be none, daily or weekly" });
+  }
+
+  const tasks = readTasks();
+  const fields = {
+    date,
+    title,
+    notes,
+    time: hasTime ? time : null,
+    startTime: hasRange ? startTime : null,
+    endTime: hasRange ? endTime : null,
+    snoozeMinutes: snooze,
+    repeat: repeat && REPEAT_MODES.has(repeat) ? repeat : "none",
+  };
+
+  const task = buildTask(fields);
+  tasks.push(task);
+
+  const extraCount =
+    fields.repeat === "daily" ? REPEAT_FORWARD_DAILY : fields.repeat === "weekly" ? REPEAT_FORWARD_WEEKLY : 0;
+  if (extraCount > 0) {
+    for (const fd of futureDates(date, fields.repeat, extraCount)) {
+      tasks.push(buildTask({ ...fields, date: fd }));
+    }
+  }
+
+  writeTasks(tasks);
+  res.status(201).json({ task, created: 1 + extraCount });
+});
+
+app.put("/api/tasks/:id", (req, res) => {
+  const { id } = req.params;
+  const tasks = readTasks();
+  const idx = tasks.findIndex((t) => t.id === id);
+  if (idx === -1) return res.status(404).json({ error: "task not found" });
+
+  const existing = tasks[idx];
+  const { date, title, startTime, endTime, time, snoozeMinutes, repeat, notes, done } = req.body || {};
+
+  const updated = {
+    ...existing,
+    date: date !== undefined ? date : existing.date,
+    title: title !== undefined ? String(title).trim() : existing.title,
+    startTime: startTime !== undefined ? (startTime === "" || startTime === null ? null : startTime) : existing.startTime,
+    endTime: endTime !== undefined ? (endTime === "" || endTime === null ? null : endTime) : existing.endTime,
+    time: time !== undefined ? (time === "" || time === null ? null : time) : existing.time,
+    snoozeMinutes: snoozeMinutes !== undefined ? Number(snoozeMinutes) || 0 : existing.snoozeMinutes,
+    repeat: repeat !== undefined ? repeat : existing.repeat,
+    notes: notes !== undefined ? sanitizeNotes(notes) : existing.notes,
+    done: done !== undefined ? Boolean(done) : Boolean(existing.done),
+  };
+
+  if (!isValidDate(updated.date)) {
+    return res.status(400).json({ error: "date must be YYYY-MM-DD" });
+  }
+  if (!updated.title || updated.title.length > 120) {
+    return res.status(400).json({ error: "title is required (max 120 chars)" });
+  }
+  if (updated.time !== null && !isValidTime(updated.time)) {
+    return res.status(400).json({ error: "time must be HH:MM" });
+  }
+  const hasRange = updated.startTime !== null && updated.startTime !== undefined && updated.endTime;
+  if (hasRange && (!isValidTime(updated.startTime) || !isValidTime(updated.endTime))) {
+    return res.status(400).json({ error: "startTime/endTime must be HH:MM" });
+  }
+  if (hasRange && toMinutes(updated.endTime) <= toMinutes(updated.startTime)) {
+    return res.status(400).json({ error: "endTime must be after startTime" });
+  }
+  if (!SNOOZE_OPTIONS.has(Number(updated.snoozeMinutes) || 0)) {
+    return res.status(400).json({ error: "snoozeMinutes must be one of 0, 3, 5, 10" });
+  }
+  if (updated.repeat !== "none" && !REPEAT_MODES.has(updated.repeat)) {
+    return res.status(400).json({ error: "repeat must be none, daily or weekly" });
+  }
+
+  updated.reminders = remindersForTask(updated.time, updated.startTime, updated.endTime, updated.snoozeMinutes);
+  tasks[idx] = updated;
+  writeTasks(tasks);
+  res.json(updated);
+});
+
+app.delete("/api/tasks/:id", (req, res) => {
+  const { id } = req.params;
+  const tasks = readTasks();
+  const next = tasks.filter((t) => t.id !== id);
+  if (next.length === tasks.length) {
+    return res.status(404).json({ error: "task not found" });
+  }
+  writeTasks(next);
+  res.status(204).end();
+});
+
+// ---------- serve the frontend ----------
+
+app.use(
+  express.static(FRONTEND_DIR, {
+    extensions: ["html"],
+    index: "index.html",
+    // The app shell must always be re-validated so updates reach browsers fast;
+    // the service worker handles offline caching itself.
+    setHeaders: (res, filePath) => {
+      if (/\.(html|js|css|json|svg|png)$/.test(filePath)) {
+        res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+      }
+    },
+  })
+);
+app.get("*", (req, res, next) => {
+  if (req.path.startsWith("/api/")) return next();
+  res.sendFile(path.join(FRONTEND_DIR, "index.html"));
+});
+
+// ---------- start ----------
+
+ensureStore();
+app.listen(PORT, () => {
+  console.log(`Task Keeper running at http://localhost:${PORT}`);
+  console.log(`Web Push public key: ${vapidKeys.publicKey.slice(0, 24)}…`);
+});

@@ -1,0 +1,21 @@
+{
+  "name": "taskkeeper-backend",
+  "version": "2.0.0",
+  "description": "Task Keeper - day-based task scheduler with 15-minute reminders, Web Push + PWA ready",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "make-icons": "node make-icons.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^7.1.0",
+    "web-push": "^3.6.7"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}

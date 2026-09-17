@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="description" content="Dayline — plan your day with tasks on a timeline and automatic reminders on every device." />
+<meta name="theme-color" content="#235B54" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-title" content="Dayline" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<link rel="manifest" href="manifest.json" />
+<link rel="icon" href="icons/icon-192.png" />
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<div class="app">
+
+  <aside class="sidebar">
+    <header class="brand">
+      <div>
+        <h1>Dayline</h1>
+        <p>keep the day, keep the hour</p>
+      </div>
+      <button id="installBtn" class="secondary-btn" type="button" hidden>📲 Install</button>
+    </header>
+
+    <section class="calendar-card">
+      <div class="calendar-nav">
+        <button id="prevMonth" class="icon-btn" aria-label="Previous month">‹</button>
+        <span id="monthLabel"></span>
+        <button id="nextMonth" class="icon-btn" aria-label="Next month">›</button>
+      </div>
+      <div class="calendar-grid" id="calendarGrid"></div>
+      <button id="todayBtn" class="text-btn">Jump to today</button>
+    </section>
+
+    <button id="tasksBtn" class="tasks-btn" type="button" aria-label="Open tasks list">
+      <span class="tasks-check" aria-hidden="true">☑</span>
+      <span class="tasks-label">Tasks</span>
+      <span class="tasks-count" id="tasksCountBadge" hidden>0</span>
+    </button>
+
+    <section class="add-card">
+      <h2>Add a task</h2>
+      <form id="taskForm">
+        <label class="field">
+          <span>What</span>
+          <input type="text" id="title" placeholder="Write the proposal" required maxlength="120" />
+        </label>
+
+        <div class="field-row">
+          <label class="field">
+            <span>Time <em>(optional)</em></span>
+            <input type="time" id="time" />
+          </label>
+          <label class="field">
+            <span>Snooze <em>(optional)</em></span>
+            <select id="snooze">
+              <option value="0">No snooze</option>
+              <option value="5">Remind 5 min later</option>
+              <option value="3">Remind 3 min later</option>
+              <option value="10">Remind 10 min later</option>
+            </select>
+          </label>
+        </div>
+
+        <label class="field">
+          <span>Repeat <em>(optional)</em></span>
+          <select id="repeat">
+            <option value="none">Doesn't repeat</option>
+            <option value="daily">Daily</option>
+            <option value="weekly">Weekly</option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span>Notes <em>(optional)</em></span>
+          <textarea id="notes" rows="2" placeholder="Anything worth remembering"></textarea>
+        </label>
+
+        <p class="reminder-preview" id="reminderPreview"></p>
+
+        <button type="submit" class="primary-btn">Save task</button>
+        <p class="form-error" id="formError" role="alert"></p>
+      </form>
+    </section>
+
+    <section class="settings-card">
+      <h2>Notifications &amp; sound</h2>
+      <p class="status-line" id="notifyStatus" role="status">Checking…</p>
+      <div class="settings-row">
+        <button id="enableNotify" class="primary-btn small" type="button" hidden>Enable notifications</button>
+        <button id="testNotify" class="text-btn" type="button" hidden>🔔 Test alert</button>
+      </div>
+      <div class="settings-row">
+        <span class="settings-label">Reminder sound</span>
+        <button id="soundToggle" class="toggle-btn" type="button" aria-pressed="true">On</button>
+      </div>
+    </section>
+  </aside>
+
+  <main class="main">
+    <header class="main-header">
+      <div>
+        <p class="eyebrow-date" id="dayOfWeek"></p>
+        <h2 id="selectedDateLabel"></h2>
+      </div>
+      <nav class="day-nav" aria-label="Move between days">
+        <button id="prevDay" class="icon-btn" type="button" aria-label="Previous day">‹</button>
+        <button id="todayQuickBtn" class="text-day-btn" type="button">Today</button>
+        <button id="nextDay" class="icon-btn" type="button" aria-label="Next day">›</button>
+      </nav>
+      <div class="header-stats">
+        <div><strong id="taskCount">0</strong><span>tasks</span></div>
+        <div><strong id="doneCount">0</strong><span>done</span></div>
+      </div>
+    </header>
+
+    <div class="timeline-wrap">
+      <div class="timeline" id="timeline"></div>
+    </div>
+
+    <section class="agenda" id="agenda" aria-label="Task list for selected day"></section>
+  </main>
+</div>
+
+<div class="modal-overlay" id="tasksModal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-label="Tasks for the selected day">
+    <div class="modal-header">
+      <h2>Tasks</h2>
+      <button id="tasksModalClose" class="modal-close" type="button" aria-label="Close">×</button>
+    </div>
+    <div class="modal-body" id="tasksModalBody"></div>
+  </div>
+</div>
+
+<div class="toast-stack" id="toastStack" aria-live="polite"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

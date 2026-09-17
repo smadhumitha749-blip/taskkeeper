@@ -1,0 +1,5 @@
+node_modules/
+backend/data/
+backend/*.log
+*.zip
+.DS_Store
