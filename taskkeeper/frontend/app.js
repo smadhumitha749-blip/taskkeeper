@@ -4,6 +4,15 @@
   const API = "/api/tasks";
   const PUSH_PUBLIC_KEY_URL = "/api/push/public-key";
 
+  async function responseError(res, fallback) {
+    const type = res.headers.get("content-type") || "";
+    if (type.includes("application/json")) {
+      const body = await res.json().catch(() => ({}));
+      if (body && body.error) return body.error;
+    }
+    return `${fallback} (server returned ${res.status})`;
+  }
+
   // ---------- state ----------
   let viewMonth = new Date();            // month currently shown in the mini calendar
   viewMonth.setDate(1);
@@ -409,6 +418,7 @@
   el.form.addEventListener("submit", async (e) => {
     e.preventDefault();
     el.formError.textContent = "";
+    const submitButton = el.form.querySelector('button[type="submit"]');
 
     const payload = {
       date: selectedDate,
@@ -420,14 +430,15 @@
     };
 
     try {
+      submitButton.disabled = true;
+      submitButton.textContent = "Saving…";
       const res = await fetch(API, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
       if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error || "Could not save task");
+        throw new Error(await responseError(res, "Could not save task"));
       }
       el.form.reset();
       el.reminderPreview.textContent = "";
@@ -435,7 +446,12 @@
       await loadSummary();
       await loadDay();
     } catch (err) {
-      el.formError.textContent = err.message;
+      el.formError.textContent = err instanceof TypeError
+        ? "Could not reach the server. Check your connection and try again."
+        : err.message;
+    } finally {
+      submitButton.disabled = false;
+      submitButton.textContent = "Save task";
     }
   });
 

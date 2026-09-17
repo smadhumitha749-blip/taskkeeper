@@ -107,14 +107,30 @@ docker run -d -p 4000:4000 -v dayline-data:/app/backend/data dayline
 Make sure `backend/data` is a persistent volume, otherwise tasks/subscriptions are lost on
 restart.
 
-### Option B — Render / Railway / Fly.io (click-to-deploy Node)
+### Option B — Render (recommended)
+
+This repository includes `render.yaml`. In Render, select **New → Blueprint**
+and choose this repository. It deploys one Docker-based **Web Service**, not a
+Static Site, so the website and `/api/tasks` API always use the same HTTPS
+origin on desktop and mobile.
+
+The Blueprint attaches a 1 GB persistent disk at `/app/backend/data`, where
+the app stores tasks, push subscriptions, and VAPID keys. Keep the service at
+one instance: JSON-file storage is intentionally single-instance. Render
+persistent disks require a paid web-service plan. A free service can run the
+app, but its saved tasks are erased whenever Render restarts or redeploys it.
+
+After the deploy is live, open the Render URL on a phone or computer. On iPhone,
+use Safari's **Share → Add to Home Screen** before enabling notifications.
+
+### Option C — Railway / Fly.io / manual Node host
 
 1. Point the platform at this repo, **Root directory**: `backend` (or the repo root with the
    Dockerfile).
 2. Build command: `npm install` — Start command: `node server.js`.
 3. Set the env vars you want (below), and give the service a public **HTTPS** URL.
 
-### Option C — VPS with pm2
+### Option D — VPS with pm2
 
 ```bash
 npm install -g pm2
@@ -132,6 +148,7 @@ for phone notifications.
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `PORT` | `4000` | HTTP port the server listens on |
+| `DATA_DIR` | `backend/data` | directory for tasks, subscriptions, and VAPID keys; set this to a persistent disk path on a host |
 | `VAPID_PUBLIC_KEY` | auto-generated | Web Push public key (base64url) |
 | `VAPID_PRIVATE_KEY` | auto-generated | Web Push private key (base64url) |
 | `VAPID_SUBJECT` | mailto from hostname | contact URL/mailto for the push service |

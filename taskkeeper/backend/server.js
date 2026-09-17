@@ -14,7 +14,9 @@ const rateLimit = require("express-rate-limit");
 const webpush = require("web-push");
 
 const PORT = process.env.PORT || 4000;
-const DATA_DIR = path.join(__dirname, "data");
+// Keep data outside the application directory when a host provides a durable
+// mount (Render, Docker, etc.).  Local development keeps using backend/data.
+const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, "data"));
 const DATA_FILE = path.join(DATA_DIR, "tasks.json");
 const SUBS_FILE = path.join(DATA_DIR, "subscriptions.json");
 const VAPID_FILE = path.join(DATA_DIR, "vapid.json");
@@ -97,7 +99,15 @@ function readJson(file, fallback) {
 
 function writeJson(file, data) {
   ensureStore();
-  fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf8");
+  // Write-then-rename prevents a partially written JSON file if the process is
+  // interrupted while saving a task.
+  const tempFile = `${file}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(tempFile, JSON.stringify(data, null, 2), "utf8");
+    fs.renameSync(tempFile, file);
+  } finally {
+    if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
+  }
 }
 
 function readTasks() {
@@ -460,6 +470,19 @@ app.post("/api/unsubscribe", (req, res) => {
 
 // ---------- API routes: tasks ----------
 
+// Used by Render to verify that both the HTTP server and its writable store
+// are available before directing users to this instance.
+app.get("/api/health", (req, res) => {
+  try {
+    ensureStore();
+    fs.accessSync(DATA_DIR, fs.constants.R_OK | fs.constants.W_OK);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Storage health check failed:", err);
+    res.status(503).json({ ok: false, error: "task storage is unavailable" });
+  }
+});
+
 // List tasks. Optional ?date=YYYY-MM-DD to filter to one day.
 app.get("/api/tasks", (req, res) => {
   const { date } = req.query;
@@ -631,4 +654,15 @@ ensureStore();
 app.listen(PORT, () => {
   console.log(`Task Keeper running at http://localhost:${PORT}`);
   console.log(`Web Push public key: ${vapidKeys.publicKey.slice(0, 24)}…`);
+});
+
+// Always return JSON for API errors. The client can then show a useful save
+// error instead of the unhelpful "Unexpected token <" from an HTML error page.
+app.use((err, req, res, next) => {
+  console.error("Unhandled request error:", err);
+  if (res.headersSent) return next(err);
+  if (req.path.startsWith("/api/")) {
+    return res.status(500).json({ error: "The server could not save your changes. Please try again." });
+  }
+  res.status(500).send("Server error");
 });
