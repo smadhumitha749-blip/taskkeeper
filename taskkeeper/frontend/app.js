@@ -541,7 +541,7 @@ const AUTH = "/api/auth";
         osc.type = "sine";
         osc.frequency.value = freq;
         const p = gain.gain;
-        p.cancelScheduledValues();
+        p.cancelScheduledValues(ctx.currentTime);
         p.setValueAtTime(0, start);
         p.linearRampToValueAtTime(vol, start + 0.02);
         p.linearRampToValueAtTime(vol, start + dur - 0.04);
@@ -565,6 +565,56 @@ const AUTH = "/api/auth";
     }
   }
 
+  // Vibrate the phone as a page-level fallback, on top of whatever vibration
+  // the OS notification itself triggers. Ignored where unsupported (desktop,
+  // iOS) or when the browser has revoked the vibration permission.
+  function vibrateDevice() {
+    if (!soundEnabled) return;
+    try {
+      if ("vibrate" in navigator) navigator.vibrate([180, 80, 180, 80, 260]);
+    } catch (err) {
+      /* unsupported */
+    }
+  }
+
+  // Show the OS notification for a reminder that fired while the app is open
+  // (as opposed to a Web Push received while the app was closed). Android
+  // Chrome throws on `new Notification(...)` — it only allows notifications
+  // created through a ServiceWorkerRegistration — so route through the SW
+  // registration whenever one is available; that also gets us the same
+  // vibration + non-silent behaviour as the push path, on every platform.
+  async function showLocalNotification(title, body, tag) {
+    const options = {
+      body,
+      tag,
+      icon: "icons/icon-192.png",
+      badge: "icons/icon-192.png",
+      renotify: true,
+      silent: false,
+      vibrate: [180, 80, 180, 80, 260],
+    };
+    if ("serviceWorker" in navigator) {
+      try {
+        const reg = await navigator.serviceWorker.getRegistration();
+        if (reg) {
+          await reg.showNotification(title, options);
+          return true;
+        }
+      } catch (err) {
+        /* fall through to the plain constructor / toast below */
+      }
+    }
+    if (window.Notification && Notification.permission === "granted") {
+      try {
+        new Notification(title, options);
+        return true;
+      } catch (err) {
+        /* Android Chrome etc. reject this — fall through to the toast */
+      }
+    }
+    return false;
+  }
+
   function notify(task, reminderTime) {
     const key = `${task.id}|${task.date}|${reminderTime}`;
     if (firedReminders.has(key)) return;
@@ -580,13 +630,12 @@ const AUTH = "/api/auth";
         : "Anytime";
     const body = `${whenText} · reminder for ${to12h(reminderTime)}`;
     playReminderSound();
+    vibrateDevice();
 
     if (window.Notification && Notification.permission === "granted") {
-      try {
-        new Notification(task.title, { body, tag: key });
-      } catch (err) {
-        showToast(task.title, body);
-      }
+      showLocalNotification(task.title, body, key).then((shown) => {
+        if (!shown) showToast(task.title, body);
+      });
     } else {
       showToast(task.title, body);
     }
@@ -668,20 +717,23 @@ const AUTH = "/api/auth";
     }
   }
 
-  // Push notifications arrive in the service worker; if a tab is open it wakes
-  // it so the chime + toast play on the page too.
+  // Push notifications arrive in the service worker, which already shows the
+  // OS notification (with sound + vibration) itself — see sw.js. If a tab is
+  // open too we just need the in-page chime, vibration and toast; calling the
+  // full notify() here would raise a second, duplicate OS notification.
   function onSWMessage(event) {
     if (!event.data || event.data.type !== "DAYLINE_REMINDER") return;
     const p = event.data.payload || {};
-    const task = {
-      id: p.id || "push",
-      date: p.date || formatDate(new Date()),
-      title: p.title || "Dayline reminder",
-      startTime: p.startTime || nowHHMM(),
-      endTime: p.endTime || nowHHMM(),
-      done: false,
-    };
-    notify(task, p.time || nowHHMM());
+    const key = `${p.id || "push"}|${p.date || formatDate(new Date())}|${p.time || nowHHMM()}`;
+    if (firedReminders.has(key)) return;
+    firedReminders.add(key);
+
+    const whenText = p.startTime && p.endTime
+      ? `${to12h(p.startTime)}–${to12h(p.endTime)}`
+      : `${to12h(p.time || nowHHMM())}`;
+    playReminderSound();
+    vibrateDevice();
+    showToast(p.title || "Dayline reminder", `${whenText} · reminder for ${to12h(p.time || nowHHMM())}`);
   }
 
   async function setupNotifications() {
@@ -754,7 +806,7 @@ const AUTH = "/api/auth";
 
   // ---------- installable PWA prompt ----------
 
-  const APP_VERSION = "2.4";
+  const APP_VERSION = "2.5";
 
   // Force a service-worker update check so everyone receives the latest fix
   // without waiting for the browser's default (often slow) refresh cycle.
@@ -771,7 +823,7 @@ const AUTH = "/api/auth";
     if (localStorage.getItem("dayline.version") !== APP_VERSION) {
       localStorage.setItem("dayline.version", APP_VERSION);
       setTimeout(() => {
-        showToast("Dayline updated", `Now running version ${APP_VERSION} — early reminders, Android install, and alerts.`);
+        showToast("Dayline updated", `Now running version ${APP_VERSION} — reminder sound fixed, vibration on mobile, and cross-device sync.`);
       }, 1200);
     }
   } catch (err) {
@@ -971,6 +1023,34 @@ const AUTH = "/api/auth";
     location.reload();
   });
 
+  // ---------- keep this device in sync with the same account on other devices ----------
+
+  // Tasks live on the server, scoped to the signed-in account, so signing into
+  // the same account on the phone and on the web already shares one dataset.
+  // What's missing without this: a device that's been sitting open won't see
+  // a task added/edited/completed on the other device until something makes
+  // it re-fetch. Re-pull whenever this tab/app becomes active again, and on a
+  // slow background interval while it stays open, so both stay in step.
+  let syncing = false;
+  async function syncFromServer() {
+    if (syncing || document.hidden) return;
+    syncing = true;
+    try {
+      await Promise.all([loadSummary(), loadDay()]);
+      renderCalendar();
+    } catch (err) {
+      /* offline — keep showing the last known state */
+    } finally {
+      syncing = false;
+    }
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) syncFromServer();
+  });
+  window.addEventListener("focus", syncFromServer);
+  window.addEventListener("online", syncFromServer);
+
   // ---------- init ----------
 
   async function init() {
@@ -980,6 +1060,7 @@ const AUTH = "/api/auth";
     await loadDay();
 
     setInterval(checkReminders, 30 * 1000); // poll twice a minute (fallback + local)
+    setInterval(syncFromServer, 45 * 1000); // pick up changes made on another device
     setInterval(() => {
       if (selectedDate === formatDate(new Date())) renderTimeline(); // move the "now" line
     }, 60 * 1000);

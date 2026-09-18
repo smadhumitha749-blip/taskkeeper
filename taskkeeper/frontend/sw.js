@@ -4,7 +4,7 @@
  *    is closed, and wakes the open page so the reminder sound can play.
  */
 
-const CACHE_NAME = "dayline-v4";
+const CACHE_NAME = "dayline-v5";
 const APP_SHELL = [
   "./",
   "./index.html",
