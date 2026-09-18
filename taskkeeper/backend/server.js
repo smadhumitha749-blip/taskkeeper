@@ -12,12 +12,18 @@ const crypto = require("crypto");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const webpush = require("web-push");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
 
 const PORT = process.env.PORT || 4000;
 // Keep data outside the application directory when a host provides a durable
 // mount (Render, Docker, etc.).  Local development keeps using backend/data.
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, "data"));
 const DATA_FILE = path.join(DATA_DIR, "tasks.json");
+const USERS_FILE = path.join(DATA_DIR, "users.json");
+const SECRET_FILE = path.join(DATA_DIR, "secret.json");
+const SESSION_COOKIE = "tk_session";
+const SESSION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const SUBS_FILE = path.join(DATA_DIR, "subscriptions.json");
 const VAPID_FILE = path.join(DATA_DIR, "vapid.json");
 const FRONTEND_DIR = path.join(__dirname, "..", "frontend");
@@ -50,7 +56,7 @@ app.use(
   })
 );
 
-app.use(cors({ origin: [/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/] }));
+app.use(cors({ origin: [/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/], credentials: true }));
 app.use(express.json({ limit: "100kb" }));
 
 // Loose API-wide limiter + a strict one for subscription writes.
@@ -86,6 +92,7 @@ function ensureStore() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, "[]", "utf8");
   if (!fs.existsSync(SUBS_FILE)) fs.writeFileSync(SUBS_FILE, "[]", "utf8");
+  if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, "[]", "utf8");
 }
 
 function readJson(file, fallback) {
@@ -114,6 +121,12 @@ function readTasks() {
   return readJson(DATA_FILE, []);
 }
 
+// Tasks are private per account: only the user identified by `userId` (the
+// task's owner) can see or change them.
+function tasksForUser(userId) {
+  return readTasks().filter((t) => t.owner === userId);
+}
+
 function writeTasks(tasks) {
   writeJson(DATA_FILE, tasks);
 }
@@ -125,6 +138,29 @@ function readSubs() {
 function writeSubs(subs) {
   writeJson(SUBS_FILE, subs);
 }
+
+function readUsers() {
+  return readJson(USERS_FILE, []);
+}
+
+function writeUsers(users) {
+  writeJson(USERS_FILE, users);
+}
+
+// Sessions use a signing secret that is generated once and persisted next to the
+// other data files, so existing sessions survive server restarts. Set
+// SESSION_SECRET in the environment to pin a fixed value instead.
+const SESSION_SECRET = process.env.SESSION_SECRET || (() => {
+  try {
+    const existing = readJson(SECRET_FILE, null);
+    if (typeof existing === "string" && existing.length >= 32) return existing;
+  } catch (err) {
+    /* fall through and generate a fresh secret */
+  }
+  const secret = crypto.randomBytes(32).toString("hex");
+  writeJson(SECRET_FILE, secret);
+  return secret;
+})();
 
 // ---------- VAPID keys (Web Push) ----------
 
@@ -152,6 +188,73 @@ const vapidKeys = getVapidKeys();
 const VAPID_SUBJECT =
   process.env.VAPID_SUBJECT || "mailto:taskkeeper@" + (require("os").hostname() || "localhost");
 webpush.setVapidDetails(VAPID_SUBJECT, vapidKeys.publicKey, vapidKeys.privateKey);
+
+// ---------- auth: accounts & sessions ----------
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function publicUser(user) {
+  return { id: user.id, email: user.email, createdAt: user.createdAt };
+}
+
+function sessionCookieOptions() {
+  return {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    maxAge: SESSION_MAX_AGE_MS,
+    path: "/",
+  };
+}
+
+function parseCookies(req) {
+  const header = req.headers.cookie || "";
+  const out = {};
+  for (const part of header.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx === -1) continue;
+    const key = part.slice(0, idx).trim();
+    const raw = part.slice(idx + 1).trim();
+    try {
+      out[key] = decodeURIComponent(raw);
+    } catch (err) {
+      out[key] = raw;
+    }
+  }
+  return out;
+}
+
+function currentUser(req) {
+  const token = parseCookies(req)[SESSION_COOKIE];
+  if (!token) return null;
+  try {
+    const payload = jwt.verify(token, SESSION_SECRET);
+    const user = readUsers().find((u) => u.id === payload.sub);
+    return user || null;
+  } catch (err) {
+    return null;
+  }
+}
+
+// Protect a route: 401 unless a valid session cookie is present. The signed-in
+// user is attached as req.user so task routes can scope data to that account.
+function requireAuth(req, res, next) {
+  const user = currentUser(req);
+  if (!user) return res.status(401).json({ error: "Please sign in to continue." });
+  req.user = user;
+  next();
+}
+
+function setSessionCookie(res, userId) {
+  const token = jwt.sign({ sub: userId }, SESSION_SECRET, { expiresIn: "30d" });
+  res.cookie(SESSION_COOKIE, token, sessionCookieOptions());
+}
+
+function clearSessionCookie(res) {
+  const opts = { ...sessionCookieOptions() };
+  delete opts.maxAge;
+  res.clearCookie(SESSION_COOKIE, opts);
+}
 
 // ---------- validation & time helpers ----------
 
@@ -237,6 +340,7 @@ function remindersForTask(time, startTime, endTime, snoozeMinutes) {
 function buildTask(fields) {
   const task = {
     id: crypto.randomUUID(),
+    owner: fields.owner || null,
     date: fields.date,
     title: fields.title.trim(),
     notes: sanitizeNotes(fields.notes),
@@ -374,7 +478,12 @@ function checkDueReminders() {
 
     for (const task of due) {
       try {
-        const { total, failed } = sendPush(task, nowHHMM, groupSubs);
+        // A task only wakes the devices that belong to its owner — subscribers
+        // from other accounts never see someone else's reminder.
+        const ownerSubs = task.owner
+          ? groupSubs.filter((s) => s.owner === task.owner)
+          : groupSubs; // legacy ownerless tasks -> notify everyone at that offset
+        const { total, failed } = sendPush(task, nowHHMM, ownerSubs);
         if (total > 0) {
           console.log(`[reminders] pushed "${task.title}" for ${nowHHMM} to ${total} device(s), ${failed} failed`);
         } else {
@@ -408,8 +517,9 @@ app.get("/api/push/public-key", (req, res) => {
   res.json({ publicKey: vapidKeys.publicKey });
 });
 
-// Register a push subscription (one per device/browser).
-app.post("/api/subscribe", subscribeLimiter, (req, res) => {
+// Register a push subscription (one per device/browser) and tie it to the
+// signed-in account so reminders only reach that user's devices.
+app.post("/api/subscribe", subscribeLimiter, requireAuth, (req, res) => {
   const body = req.body || {};
   const endpoint = typeof body.endpoint === "string" ? body.endpoint.trim() : "";
   const keys = body.keys && typeof body.keys === "object" ? body.keys : {};
@@ -438,6 +548,9 @@ app.post("/api/subscribe", subscribeLimiter, (req, res) => {
   if (existing) {
     // Re-subscribing on a later app load: keep the device, but refresh its
     // timezone offset and last-seen time (the user may have changed timezone).
+    // If a device was previously used by a different account, it now belongs
+    // to whoever is signed in on it.
+    existing.owner = req.user.id;
     if (body.utcOffsetMinutes !== undefined && body.utcOffsetMinutes !== null) {
       existing.utcOffsetMinutes = Number(body.utcOffsetMinutes);
     }
@@ -451,6 +564,7 @@ app.post("/api/subscribe", subscribeLimiter, (req, res) => {
 
   subs.push({
     endpoint,
+    owner: req.user.id,
     expirationTime: typeof body.expirationTime === "string" && body.expirationTime ? body.expirationTime : null,
     utcOffsetMinutes,
     keys: { p256dh: keys.p256dh, auth: keys.auth },
@@ -461,11 +575,78 @@ app.post("/api/subscribe", subscribeLimiter, (req, res) => {
 });
 
 // Unregister a push subscription (called by the app when notifications are off).
-app.post("/api/unsubscribe", (req, res) => {
+app.post("/api/unsubscribe", requireAuth, (req, res) => {
   const endpoint = req.body && typeof req.body.endpoint === "string" ? req.body.endpoint.trim() : "";
   if (!endpoint) return res.status(400).json({ error: "endpoint is required" });
-  removeSubscription(endpoint);
+  writeSubs(readSubs().filter((s) => !(s.endpoint === endpoint && s.owner === req.user.id)));
   res.json({ ok: true });
+});
+
+// ---------- auth routes ----------
+
+app.post("/api/auth/signup", (req, res) => {
+  const body = req.body || {};
+  const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+  if (!EMAIL_RE.test(email) || email.length > 254) {
+    return res.status(400).json({ error: "Enter a valid email address." });
+  }
+  if (typeof body.password !== "string" || body.password.length < 8 || body.password.length > 72) {
+    return res.status(400).json({ error: "Password must be 8–72 characters." });
+  }
+
+  const users = readUsers();
+  if (users.some((u) => u.email === email)) {
+    return res.status(409).json({ error: "An account with that email already exists — try signing in." });
+  }
+
+  const user = {
+    id: crypto.randomUUID(),
+    email,
+    passwordHash: bcrypt.hashSync(body.password, 10),
+    createdAt: new Date().toISOString(),
+  };
+  users.push(user);
+  writeUsers(users);
+
+  // Tasks created before accounts existed have no owner. The first person to
+  // create an account keeps that earlier data so nothing is lost.
+  const tasks = readTasks();
+  let adopted = 0;
+  for (const t of tasks) {
+    if (!t.owner) {
+      t.owner = user.id;
+      adopted += 1;
+    }
+  }
+  if (adopted > 0) writeTasks(tasks);
+
+  setSessionCookie(res, user.id);
+  console.log(`[auth] signup ${user.email} (adopted ${adopted} legacy task(s))`);
+  res.status(201).json({ user: publicUser(user) });
+});
+
+app.post("/api/auth/login", (req, res) => {
+  const body = req.body || {};
+  const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+  const password = typeof body.password === "string" ? body.password : "";
+  const user = readUsers().find((u) => u.email === email);
+  if (!user || !bcrypt.compareSync(password, user.passwordHash)) {
+    return res.status(401).json({ error: "Incorrect email or password." });
+  }
+  setSessionCookie(res, user.id);
+  console.log(`[auth] login ${user.email}`);
+  res.json({ user: publicUser(user) });
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  clearSessionCookie(res);
+  res.json({ ok: true });
+});
+
+app.get("/api/auth/me", (req, res) => {
+  const user = currentUser(req);
+  if (!user) return res.status(401).json({ error: "Not signed in." });
+  res.json({ user: publicUser(user) });
 });
 
 // ---------- API routes: tasks ----------
@@ -483,10 +664,10 @@ app.get("/api/health", (req, res) => {
   }
 });
 
-// List tasks. Optional ?date=YYYY-MM-DD to filter to one day.
-app.get("/api/tasks", (req, res) => {
+// List tasks for the signed-in user. Optional ?date=YYYY-MM-DD to filter to one day.
+app.get("/api/tasks", requireAuth, (req, res) => {
   const { date } = req.query;
-  let tasks = readTasks();
+  let tasks = tasksForUser(req.user.id);
   if (date) {
     if (!isValidDate(date)) {
       return res.status(400).json({ error: "date must be in YYYY-MM-DD format" });
@@ -499,14 +680,14 @@ app.get("/api/tasks", (req, res) => {
 });
 
 // Dates that have at least one task, with a count — used to mark the calendar.
-app.get("/api/tasks/summary", (req, res) => {
-  const tasks = readTasks();
+app.get("/api/tasks/summary", requireAuth, (req, res) => {
+  const tasks = tasksForUser(req.user.id);
   const counts = {};
   for (const t of tasks) counts[t.date] = (counts[t.date] || 0) + 1;
   res.json(counts);
 });
 
-app.post("/api/tasks", (req, res) => {
+app.post("/api/tasks", requireAuth, (req, res) => {
   const body = req.body || {};
   const { date, title, time, startTime, endTime, notes, snoozeMinutes, repeat } = body;
 
@@ -541,6 +722,7 @@ app.post("/api/tasks", (req, res) => {
 
   const tasks = readTasks();
   const fields = {
+    owner: req.user.id,
     date,
     title,
     notes,
@@ -566,10 +748,10 @@ app.post("/api/tasks", (req, res) => {
   res.status(201).json({ task, created: 1 + extraCount });
 });
 
-app.put("/api/tasks/:id", (req, res) => {
+app.put("/api/tasks/:id", requireAuth, (req, res) => {
   const { id } = req.params;
   const tasks = readTasks();
-  const idx = tasks.findIndex((t) => t.id === id);
+  const idx = tasks.findIndex((t) => t.id === id && t.owner === req.user.id);
   if (idx === -1) return res.status(404).json({ error: "task not found" });
 
   const existing = tasks[idx];
@@ -617,10 +799,10 @@ app.put("/api/tasks/:id", (req, res) => {
   res.json(updated);
 });
 
-app.delete("/api/tasks/:id", (req, res) => {
+app.delete("/api/tasks/:id", requireAuth, (req, res) => {
   const { id } = req.params;
   const tasks = readTasks();
-  const next = tasks.filter((t) => t.id !== id);
+  const next = tasks.filter((t) => !(t.id === id && t.owner === req.user.id));
   if (next.length === tasks.length) {
     return res.status(404).json({ error: "task not found" });
   }

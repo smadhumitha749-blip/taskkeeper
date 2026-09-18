@@ -19,6 +19,30 @@
 </head>
 <body>
 
+<div class="auth-overlay" id="authOverlay">
+  <div class="auth-card">
+    <h1 class="auth-title">Dayline</h1>
+    <p class="auth-tagline">keep the day, keep the hour</p>
+    <div class="auth-tabs" role="tablist" aria-label="Sign in or create an account">
+      <button type="button" class="auth-tab is-active" id="authTabLogin" role="tab">Sign in</button>
+      <button type="button" class="auth-tab" id="authTabSignup" role="tab">Create account</button>
+    </div>
+    <form id="authForm" novalidate>
+      <label class="field">
+        <span>Email</span>
+        <input type="email" id="authEmail" autocomplete="email" required maxlength="254" />
+      </label>
+      <label class="field">
+        <span>Password</span>
+        <input type="password" id="authPassword" autocomplete="current-password" required minlength="8" maxlength="72" />
+      </label>
+      <p class="form-error" id="authError" role="alert"></p>
+      <button type="submit" class="primary-btn" id="authSubmit">Sign in</button>
+    </form>
+    <p class="auth-hint" id="authHint"></p>
+  </div>
+</div>
+
 <div class="app">
 
   <aside class="sidebar">
@@ -101,6 +125,10 @@
       <div class="settings-row">
         <span class="settings-label">Reminder sound</span>
         <button id="soundToggle" class="toggle-btn" type="button" aria-pressed="true">On</button>
+      </div>
+      <div class="settings-row account-row">
+        <span class="settings-label account-email" id="accountLabel">Not signed in</span>
+        <button id="logoutBtn" class="text-btn" type="button" hidden>Log out</button>
       </div>
     </section>
   </aside>

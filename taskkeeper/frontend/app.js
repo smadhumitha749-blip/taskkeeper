@@ -2,6 +2,7 @@
   "use strict";
 
   const API = "/api/tasks";
+const AUTH = "/api/auth";
   const PUSH_PUBLIC_KEY_URL = "/api/push/public-key";
 
   async function responseError(res, fallback) {
@@ -61,6 +62,18 @@
     timeline: document.getElementById("timeline"),
     agenda: document.getElementById("agenda"),
     toastStack: document.getElementById("toastStack"),
+
+    authOverlay: document.getElementById("authOverlay"),
+    authForm: document.getElementById("authForm"),
+    authEmail: document.getElementById("authEmail"),
+    authPassword: document.getElementById("authPassword"),
+    authError: document.getElementById("authError"),
+    authSubmit: document.getElementById("authSubmit"),
+    authTabLogin: document.getElementById("authTabLogin"),
+    authTabSignup: document.getElementById("authTabSignup"),
+    authHint: document.getElementById("authHint"),
+    accountLabel: document.getElementById("accountLabel"),
+    logoutBtn: document.getElementById("logoutBtn"),
   };
 
   // Safety net: if the browser is serving a mismatched mix of cached files
@@ -719,7 +732,7 @@
 
   // ---------- installable PWA prompt ----------
 
-  const APP_VERSION = "2.1";
+  const APP_VERSION = "2.2";
 
   // Force a service-worker update check so everyone receives the latest fix
   // without waiting for the browser's default (often slow) refresh cycle.
@@ -862,6 +875,78 @@
     el.tasksCountBadge.hidden = tasksForDay.length === 0;
   }
 
+  // ---------- accounts: sign in / sign up / log out ----------
+
+  let currentUser = null;
+  let authMode = "login"; // "login" | "signup"
+
+  function setAuthMode(mode) {
+    authMode = mode;
+    el.authTabLogin.classList.toggle("is-active", mode === "login");
+    el.authTabSignup.classList.toggle("is-active", mode === "signup");
+    el.authSubmit.textContent = mode === "login" ? "Sign in" : "Create account";
+    el.authPassword.autocomplete = mode === "login" ? "current-password" : "new-password";
+    el.authHint.textContent =
+      mode === "login"
+        ? "New here? Create an account so only you can see your tasks."
+        : "Pick a password of at least 8 characters. Your tasks stay private to this account.";
+  }
+
+  el.authTabLogin.addEventListener("click", () => setAuthMode("login"));
+  el.authTabSignup.addEventListener("click", () => setAuthMode("signup"));
+
+  el.authForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const email = el.authEmail.value.trim();
+    const password = el.authPassword.value;
+    if (!email || !password) {
+      el.authError.textContent = "Enter your email and password.";
+      return;
+    }
+    el.authError.textContent = "";
+    el.authSubmit.disabled = true;
+    el.authSubmit.textContent = authMode === "login" ? "Signing in…" : "Creating account…";
+    try {
+      const res = await fetch(`${AUTH}/${authMode}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password }),
+      });
+      if (!res.ok) {
+        throw new Error(
+          await responseError(res, authMode === "login" ? "Could not sign in" : "Could not create account")
+        );
+      }
+      const data = await res.json();
+      sessionStarted(data.user);
+    } catch (err) {
+      el.authError.textContent =
+        err instanceof TypeError
+          ? "Could not reach the server. Check your connection and try again."
+          : err.message;
+    } finally {
+      el.authSubmit.disabled = false;
+      setAuthMode(authMode);
+    }
+  });
+
+  function sessionStarted(user) {
+    currentUser = user;
+    el.accountLabel.textContent = user.email;
+    el.logoutBtn.hidden = false;
+    el.authOverlay.hidden = true;
+    init();
+  }
+
+  el.logoutBtn.addEventListener("click", async () => {
+    try {
+      await fetch(`${AUTH}/logout`, { method: "POST" });
+    } catch (err) {
+      /* Even offline, drop the local session and go back to the sign-in screen. */
+    }
+    location.reload();
+  });
+
   // ---------- init ----------
 
   async function init() {
@@ -876,5 +961,23 @@
     }, 60 * 1000);
   }
 
-  init();
+  // The app shell starts hidden behind the auth overlay. Confirm the session
+  // cookie before revealing it; with a valid session the overlay is dismissed,
+  // otherwise the user can sign in or create an account.
+  async function boot() {
+    try {
+      const res = await fetch(`${AUTH}/me`);
+      if (res.ok) {
+        const data = await res.json();
+        sessionStarted(data.user);
+        return;
+      }
+    } catch (err) {
+      el.authError.textContent = "Could not reach the server. Check your connection and try again.";
+    }
+    el.authOverlay.hidden = false;
+    setAuthMode("login");
+  }
+
+  boot();
 })();

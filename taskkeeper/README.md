@@ -20,6 +20,10 @@ computed automatically from whatever start/end time you set.
   API — no audio files, works offline). There's a sound on/off toggle in the sidebar.
 - **See past days.** Browse any previous day with the mini-calendar or the ‹ Today › buttons
   in the header — all past tasks and times are right where you left them.
+- **Private per-account tasks.** Everyone who uses the deployed app signs up with an email
+  and password (sessions via a secure HTTP-only cookie). Each account only sees its own
+  tasks, so two people can use the same deployment without mixing data. Tasks created
+  before accounts existed are kept by the first account that signs up.
 - **Security.** Helmet security headers + CSP, API rate limiting, strict input validation,
   restricted CORS, no exposed server internals.
 - **Deployment-ready.** Dockerfile included; deploy on Render, Railway, Fly.io, a VPS, or
@@ -32,7 +36,7 @@ taskkeeper/
 ├── backend/          Express API + JSON-file storage (also serves the frontend)
 │   ├── server.js     security + API + Web Push scheduler
 │   ├── make-icons.js generates the PNG app icons (run: npm run make-icons)
-│   └── data/         created automatically on first run (tasks, subscriptions, vapid)
+│   └── data/         created automatically on first run (tasks, subscriptions, users, vapid)
 ├── frontend/         Plain HTML/CSS/JS — no build step
 │   ├── index.html / styles.css / app.js
 │   ├── manifest.json + sw.js        (PWA manifest + service worker for offline & push)
@@ -148,7 +152,8 @@ for phone notifications.
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `PORT` | `4000` | HTTP port the server listens on |
-| `DATA_DIR` | `backend/data` | directory for tasks, subscriptions, and VAPID keys; set this to a persistent disk path on a host |
+| `DATA_DIR` | `backend/data` | directory for tasks, subscriptions, users, and VAPID keys; set this to a persistent disk path on a host |
+| `SESSION_SECRET` | auto-generated, saved to `data/secret.json` | secret used to sign login session cookies |
 | `VAPID_PUBLIC_KEY` | auto-generated | Web Push public key (base64url) |
 | `VAPID_PRIVATE_KEY` | auto-generated | Web Push private key (base64url) |
 | `VAPID_SUBJECT` | mailto from hostname | contact URL/mailto for the push service |
@@ -159,14 +164,22 @@ for phone notifications.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/tasks?date=` | List tasks for a given `YYYY-MM-DD` date |
-| GET | `/api/tasks/summary` | `{ "YYYY-MM-DD": count, ... }` for all days with tasks |
-| POST | `/api/tasks` | Create a task: `{ date, title, startTime, endTime, notes }` |
-| PUT | `/api/tasks/:id` | Update a task (any subset, plus `done`) |
-| DELETE | `/api/tasks/:id` | Delete a task |
+| POST | `/api/auth/signup` | Create an account: `{ email, password }` -> sets a session cookie |
+| POST | `/api/auth/login` | Sign in: `{ email, password }` -> sets a session cookie |
+| POST | `/api/auth/logout` | Clear the session cookie |
+| GET | `/api/auth/me` | Current signed-in user, or `401` |
+| GET | `/api/tasks?date=` | List *your* tasks for a given `YYYY-MM-DD` date (requires auth) |
+| GET | `/api/tasks/summary` | `{ "YYYY-MM-DD": count, ... }` for all days with *your* tasks (requires auth) |
+| POST | `/api/tasks` | Create a task: `{ date, title, startTime, endTime, notes }` (requires auth) |
+| PUT | `/api/tasks/:id` | Update a task (any subset, plus `done`) — you can only change your own |
+| DELETE | `/api/tasks/:id` | Delete a task — you can only delete your own |
 | GET | `/api/push/public-key` | VAPID public key for the browser to subscribe |
-| POST | `/api/subscribe` | Register this device for push notifications |
-| POST | `/api/unsubscribe` | Remove a device push subscription |
+| POST | `/api/subscribe` | Register this device for push notifications (requires auth) |
+| POST | `/api/unsubscribe` | Remove a device push subscription (requires auth) |
+
+All task and subscription endpoints require a session cookie (sent automatically by the
+browser once signed in); without one they return `401`. Tasks belong to the signed-in
+account, so user A can never read or modify user B's tasks.
 
 Times are `HH:MM` 24-hour strings. The server computes and stores `reminders` (an array of
 `HH:MM` strings) whenever a task is created or its times change.
