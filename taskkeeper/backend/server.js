@@ -311,24 +311,29 @@ function sanitizeNotes(notes) {
 
 // ---------- task model: time / snooze / repeat ----------
 
-const SNOOZE_OPTIONS = new Set([0, 3, 5, 10]);
+const SNOOZE_OPTIONS = new Set([0, 2, 3, 5, 10]);
 const REPEAT_MODES = new Set(["none", "daily", "weekly"]);
 // How many future instances a repeating task gets materialized into.
 const REPEAT_FORWARD_DAILY = Number(process.env.REPEAT_DAILY_DAYS || 60);
 const REPEAT_FORWARD_WEEKLY = Number(process.env.REPEAT_WEEKLY_WEEKS || 13);
 
-// Existing range tasks keep the old midpoint rule; new tasks with a single
-// `time` get a reminder at that time plus one extra at time+snoozeMinutes.
+// Tasks with a single `time` get a reminder at that time. If an "early
+// reminder" is set (snoozeMinutes) they also get one that many minutes BEFORE
+// the event time, so options read "Remind 2/3/5/10 min early". Range tasks keep
+// the old midpoint rule; checklist-only items have no reminders.
 function remindersForTask(time, startTime, endTime, snoozeMinutes) {
   if (time && isValidTime(time)) {
-    const list = [time];
-    const snooze = Number(snoozeMinutes) || 0;
-    if (snooze > 0 && SNOOZE_OPTIONS.has(snooze)) {
-      const t = toMinutes(time) + snooze;
-      const h = String(Math.floor(t / 60)).padStart(2, "0");
-      const m = String(t % 60).padStart(2, "0");
-      list.push(`${h}:${m}`);
+    const list = [];
+    const early = Number(snoozeMinutes) || 0;
+    if (early > 0 && SNOOZE_OPTIONS.has(early)) {
+      const t = toMinutes(time) - early;
+      if (t >= 0) {
+        const h = String(Math.floor(t / 60)).padStart(2, "0");
+        const m = String(t % 60).padStart(2, "0");
+        list.push(`${h}:${m}`);
+      }
     }
+    list.push(time);
     return list;
   }
   if (isValidTime(startTime) && isValidTime(endTime)) {
@@ -386,7 +391,7 @@ function sendPush(task, time, subs) {
   const whenText = isRange
     ? `${to12h(task.startTime)}–${to12h(task.endTime)}`
     : eventTime
-      ? `${to12h(eventTime)}${task.snoozeMinutes ? ` · snooze +${task.snoozeMinutes}m` : ""}`
+      ? `${to12h(eventTime)}${task.snoozeMinutes ? ` · early ${task.snoozeMinutes}m` : ""}`
       : "Anytime";
   const payload = {
     title: task.title,
@@ -714,7 +719,7 @@ app.post("/api/tasks", requireAuth, (req, res) => {
   }
   const snooze = snoozeMinutes === undefined || snoozeMinutes === null || snoozeMinutes === "" ? 0 : Number(snoozeMinutes);
   if (!SNOOZE_OPTIONS.has(snooze)) {
-    return res.status(400).json({ error: "snoozeMinutes must be one of 0, 3, 5, 10" });
+    return res.status(400).json({ error: "snoozeMinutes must be one of 0, 2, 3, 5, 10" });
   }
   if (repeat !== undefined && repeat !== null && repeat !== "" && !REPEAT_MODES.has(repeat)) {
     return res.status(400).json({ error: "repeat must be none, daily or weekly" });
@@ -787,7 +792,7 @@ app.put("/api/tasks/:id", requireAuth, (req, res) => {
     return res.status(400).json({ error: "endTime must be after startTime" });
   }
   if (!SNOOZE_OPTIONS.has(Number(updated.snoozeMinutes) || 0)) {
-    return res.status(400).json({ error: "snoozeMinutes must be one of 0, 3, 5, 10" });
+    return res.status(400).json({ error: "snoozeMinutes must be one of 0, 2, 3, 5, 10" });
   }
   if (updated.repeat !== "none" && !REPEAT_MODES.has(updated.repeat)) {
     return res.status(400).json({ error: "repeat must be none, daily or weekly" });

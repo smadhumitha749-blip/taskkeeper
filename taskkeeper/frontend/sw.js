@@ -4,7 +4,7 @@
  *    is closed, and wakes the open page so the reminder sound can play.
  */
 
-const CACHE_NAME = "dayline-v3";
+const CACHE_NAME = "dayline-v4";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -71,6 +71,12 @@ self.addEventListener("push", (event) => {
     icon: payload.icon || "./icons/icon-192.png",
     badge: "./icons/icon-192.png",
     renotify: true,
+    // Android uses the Chrome notification channel for the audible alert. Ask
+    // for that normal channel explicitly and provide a vibration fallback for
+    // phones set to vibrate or silent mode. A service worker cannot play a
+    // custom sound while the app is closed.
+    silent: false,
+    vibrate: [180, 80, 180, 80, 260],
     data: { url: "./", task: payload },
   };
 

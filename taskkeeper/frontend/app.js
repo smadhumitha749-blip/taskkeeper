@@ -234,15 +234,19 @@ const AUTH = "/api/auth";
 
   // ---------- reminder preview in the form ----------
 
-  // Mirrors the backend: one event time + an optional snooze reminder.
-  function previewReminders(time, snooze) {
-    const list = [time];
-    if (snooze > 0) {
-      const t = toMinutes(time) + snooze;
-      const h = String(Math.floor(t / 60)).padStart(2, "0");
-      const m = String(t % 60).padStart(2, "0");
-      list.push(`${h}:${m}`);
+  // Mirrors the backend: a reminder at the event time plus an optional early
+  // reminder (snoozeMinutes minutes BEFORE the event time).
+  function previewReminders(time, early) {
+    const list = [];
+    if (early > 0) {
+      const t = toMinutes(time) - early;
+      if (t >= 0) {
+        const h = String(Math.floor(t / 60)).padStart(2, "0");
+        const m = String(t % 60).padStart(2, "0");
+        list.push(`${h}:${m}`);
+      }
     }
+    list.push(time);
     return list;
   }
 
@@ -394,7 +398,7 @@ const AUTH = "/api/auth";
         .map((r) => `<span>${to12h(r)}</span>`)
         .join("");
       const taskTimeText = task.time
-        ? to12h(task.time) + (task.snoozeMinutes ? ` · snooze ${task.snoozeMinutes}m` : "")
+        ? to12h(task.time) + (task.snoozeMinutes ? ` · early ${task.snoozeMinutes}m` : "")
         : task.startTime && task.endTime
           ? `${to12h(task.startTime)} – ${to12h(task.endTime)}`
           : "Any time";
@@ -502,6 +506,24 @@ const AUTH = "/api/auth";
 
   let audioCtx = null;
 
+  // Browsers keep the Web Audio context "suspended" (silent) until the user has
+  // interacted with the page at least once. Reminders often fire while the app
+  // is running in the background or right after a push, so we prime the context
+  // on the very first tap/keypress — after that, reminder chimes can always play.
+  function primeAudio() {
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      if (!audioCtx) audioCtx = new AC();
+      if (audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
+    } catch (err) {
+      /* audio unavailable */
+    }
+  }
+  ["pointerdown", "touchstart", "keydown", "click"].forEach((eventName) =>
+    window.addEventListener(eventName, primeAudio, { passive: true })
+  );
+
   // Plays a short "task is due" warning chime using the Web Audio API — no audio
   // files needed, works offline, and respects the sound toggle.
   function playReminderSound() {
@@ -511,7 +533,7 @@ const AUTH = "/api/auth";
       if (!AC) return;
       if (!audioCtx) audioCtx = new AC();
       const ctx = audioCtx;
-      if (ctx.state === "suspended") ctx.resume();
+      if (ctx.state === "suspended") ctx.resume().catch(() => {});
 
       const tone = (start, freq, dur, vol) => {
         const osc = ctx.createOscillator();
@@ -554,7 +576,7 @@ const AUTH = "/api/auth";
     const whenText = task.startTime && task.endTime
       ? `${to12h(task.startTime)}–${to12h(task.endTime)}`
       : eventTime
-        ? `${to12h(eventTime)}${task.snoozeMinutes ? ` · snooze +${task.snoozeMinutes}m` : ""}`
+        ? `${to12h(eventTime)}${task.snoozeMinutes ? ` · early ${task.snoozeMinutes}m` : ""}`
         : "Anytime";
     const body = `${whenText} · reminder for ${to12h(reminderTime)}`;
     playReminderSound();
@@ -732,7 +754,7 @@ const AUTH = "/api/auth";
 
   // ---------- installable PWA prompt ----------
 
-  const APP_VERSION = "2.2";
+  const APP_VERSION = "2.4";
 
   // Force a service-worker update check so everyone receives the latest fix
   // without waiting for the browser's default (often slow) refresh cycle.
@@ -749,7 +771,7 @@ const AUTH = "/api/auth";
     if (localStorage.getItem("dayline.version") !== APP_VERSION) {
       localStorage.setItem("dayline.version", APP_VERSION);
       setTimeout(() => {
-        showToast("Dayline updated", `Now running version ${APP_VERSION} — the Install button is fixed.`);
+        showToast("Dayline updated", `Now running version ${APP_VERSION} — early reminders, Android install, and alerts.`);
       }, 1200);
     }
   } catch (err) {
@@ -792,8 +814,10 @@ const AUTH = "/api/auth";
     // fired yet) — give the user concrete steps instead of a dead button.
     if (/iphone|ipad|ipod/i.test(navigator.userAgent || "")) {
       showToast("Install Dayline", "Tap Share, then “Add to Home Screen” to install on iPhone.");
+    } else if (/android/i.test(navigator.userAgent || "")) {
+      showToast("Install Dayline", "Tap the ⋮ menu → “Add to Home screen” or “Install app” to install on Android.");
     } else {
-      showToast("Install Dayline", "This browser can't auto-install — open this page in Chrome or Edge and click the install icon in the address bar.");
+      showToast("Install Dayline", "Open this page in Chrome or Edge and click the install icon in the address bar.");
     }
   });
 
@@ -830,7 +854,7 @@ const AUTH = "/api/auth";
       const text = document.createElement("div");
       text.className = "modal-task-text";
       const timeText = task.time
-        ? to12h(task.time) + (task.snoozeMinutes ? ` · snooze ${task.snoozeMinutes}m` : "")
+        ? to12h(task.time) + (task.snoozeMinutes ? ` · early ${task.snoozeMinutes}m` : "")
         : task.startTime && task.endTime
           ? `${to12h(task.startTime)} – ${to12h(task.endTime)}`
           : "";

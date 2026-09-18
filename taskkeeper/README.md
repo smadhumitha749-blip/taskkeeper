@@ -5,8 +5,10 @@ visual timeline for that day. Tasks are saved to disk, so picking the same date 
 tomorrow, next week, whenever — brings the tasks right back.
 
 **Reminder rule:** for a task from 5:00–6:00 PM, you get reminded starting at the midpoint
-of the window (5:30), then every 15 minutes until it ends (5:30, 5:45, 6:00). This is
-computed automatically from whatever start/end time you set.
+of the window (5:30), then every 15 minutes until it ends (5:30, 5:45, 6:00). Tasks with a
+single time get a reminder exactly at that time, plus an optional **early reminder**
+2/3/5/10 minutes *before* it (pick one in the "Early reminder" dropdown). All of this is
+computed automatically from the times you set.
 
 ## What makes this version special
 
