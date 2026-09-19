@@ -623,6 +623,7 @@ function clockAtOffset(nowMs, offset) {
 }
 
 async function checkDueReminders() {
+  if (USE_MONGO && !db) return; // storage still starting up — skip this tick
   const tasks = await readTasks();
   const subs = await readSubs();
   const nowMs = Date.now();
