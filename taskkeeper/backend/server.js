@@ -1,8 +1,9 @@
 // Task Keeper backend — v2
-// Express + JSON-file storage, hardened with security headers, rate limiting
-// and strict input validation. Adds Web Push (VAPID) so reminders reach the
-// phone/desktop even when the browser tab is closed, plus a built-in scheduler
-// that pushes notifications at each reminder time while the server is running.
+// Express + JSON-file or MongoDB storage, hardened with security headers, rate
+// limiting and strict input validation. Adds Web Push (VAPID) so reminders
+// reach the phone/desktop even when the browser tab is closed, plus a
+// built-in scheduler that pushes notifications at each reminder time while the
+// server is running.
 
 const express = require("express");
 const cors = require("cors");
@@ -27,6 +28,26 @@ const SESSION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const SUBS_FILE = path.join(DATA_DIR, "subscriptions.json");
 const VAPID_FILE = path.join(DATA_DIR, "vapid.json");
 const FRONTEND_DIR = path.join(__dirname, "..", "frontend");
+
+// Optional MongoDB backend (recommended for hosted deploys). When MONGODB_URI
+// is set, all data (tasks, users, push subscriptions, VAPID/session keys) is
+// stored in the managed database — durable and secure — instead of local JSON
+// files. Hosts like Render's free tier wipe the local filesystem whenever the
+// instance restarts or redeploys, so local files are only safe for local
+// development or when mounted on a persistent disk.
+const MONGO_URI = process.env.MONGODB_URI || process.env.MONGO_URI || "";
+const USE_MONGO = MONGO_URI.length > 0;
+const MONGO_DB_NAME =
+  process.env.MONGODB_DB ||
+  (() => {
+    try {
+      // Prefer the database name embedded in the connection string.
+      return new URL(MONGO_URI).pathname.replace(/^\/+/, "").replace(/\/+$/, "");
+    } catch (err) {
+      return "";
+    }
+  })() ||
+  "taskkeeper";
 const MAX_SUBSCRIPTIONS = Number(process.env.MAX_SUBSCRIPTIONS || 1000);
 
 const app = express();
@@ -87,8 +108,19 @@ app.use((req, res, next) => {
 app.use("/api", apiLimiter);
 
 // ---------- storage helpers ----------
+//
+// Two interchangeable backends behind the same interface:
+//   • MongoDB (managed, durable) — used when MONGODB_URI is set. Every task,
+//     user, and push subscription is stored as its own document, so data
+//     survives restarts, redeploys and instance changes on any host.
+//   • JSON files in backend/data — used when MONGODB_URI is unset (local dev).
+//
+// All read/write helpers are async: the Mongo driver is asynchronous and the
+// same call sites are shared by both backends.
 
-function ensureStore() {
+let db = null; // connected Mongo database handle (null in JSON-file mode)
+
+function ensureJsonStore() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, "[]", "utf8");
   if (!fs.existsSync(SUBS_FILE)) fs.writeFileSync(SUBS_FILE, "[]", "utf8");
@@ -105,7 +137,7 @@ function readJson(file, fallback) {
 }
 
 function writeJson(file, data) {
-  ensureStore();
+  ensureJsonStore();
   // Write-then-rename prevents a partially written JSON file if the process is
   // interrupted while saving a task.
   const tempFile = `${file}.${process.pid}.${Date.now()}.tmp`;
@@ -117,40 +149,148 @@ function writeJson(file, data) {
   }
 }
 
-function readTasks() {
+// Mongo documents carry a driver-owned `_id`; drop it so API responses (and
+// the rest of the app) only ever see the plain objects the JSON store had.
+const stripId = (doc) => {
+  if (doc && doc._id) delete doc._id;
+  return doc;
+};
+
+async function connectMongo() {
+  const { MongoClient } = require("mongodb");
+  const client = new MongoClient(MONGO_URI, {
+    serverSelectionTimeoutMS: 15000,
+    // Atlas (`mongodb+srv://`) always uses TLS. For self-hosted servers you can
+    // force it with MONGODB_TLS=true.
+    tls: process.env.MONGODB_TLS ? process.env.MONGODB_TLS !== "false" : MONGO_URI.startsWith("mongodb+srv://"),
+  });
+  await client.connect();
+  db = client.db(MONGO_DB_NAME);
+  // Indexes keep the most common queries fast and enforce the same uniqueness
+  // the app already relies on (one account per email, one task per id).
+  await db.collection("tasks").createIndex({ owner: 1, date: 1 });
+  await db.collection("tasks").createIndex({ id: 1 }, { unique: true });
+  await db.collection("users").createIndex({ email: 1 }, { unique: true });
+  await db.collection("subscriptions").createIndex({ endpoint: 1 });
+  console.log(`MongoDB connected (database "${MONGO_DB_NAME}").`);
+}
+
+// Verify the active store is reachable. Used at boot and by /api/health.
+async function ensureStore() {
+  if (USE_MONGO) {
+    if (!db) throw new Error("MongoDB is not connected");
+    await db.command({ ping: 1 });
+    return;
+  }
+  ensureJsonStore();
+}
+
+// Replace a whole collection's documents with `docs`, mirroring the
+// "load all, mutate, save all" semantics of the JSON-file store. Documents are
+// keyed by `idField` (id / endpoint), so updated docs are $set and anything
+// removed in memory is deleted.
+async function replaceAll(collName, docs, idField) {
+  const coll = db.collection(collName);
+  const ids = docs.map((d) => d[idField]);
+  const ops = docs.map((d) => ({
+    updateOne: {
+      filter: { [idField]: d[idField] },
+      update: { $set: d },
+      upsert: true,
+    },
+  }));
+  if (ids.length === 0) {
+    await coll.deleteMany({});
+  } else {
+    await coll.deleteMany({ [idField]: { $nin: ids } });
+  }
+  if (ops.length) await coll.bulkWrite(ops, { ordered: false });
+}
+
+async function readTasks() {
+  if (USE_MONGO) {
+    if (!db) throw new Error("MongoDB is not connected yet");
+    return (await db.collection("tasks").find({}).toArray()).map(stripId);
+  }
   return readJson(DATA_FILE, []);
 }
 
 // Tasks are private per account: only the user identified by `userId` (the
 // task's owner) can see or change them.
-function tasksForUser(userId) {
-  return readTasks().filter((t) => t.owner === userId);
+async function tasksForUser(userId) {
+  return (await readTasks()).filter((t) => t.owner === userId);
 }
 
-function writeTasks(tasks) {
+async function writeTasks(tasks) {
+  if (USE_MONGO) return replaceAll("tasks", tasks, "id");
   writeJson(DATA_FILE, tasks);
 }
 
-function readSubs() {
+async function readSubs() {
+  if (USE_MONGO) {
+    if (!db) throw new Error("MongoDB is not connected yet");
+    return (await db.collection("subscriptions").find({}).toArray()).map(stripId);
+  }
   return readJson(SUBS_FILE, []);
 }
 
-function writeSubs(subs) {
+async function writeSubs(subs) {
+  if (USE_MONGO) return replaceAll("subscriptions", subs, "endpoint");
   writeJson(SUBS_FILE, subs);
 }
 
-function readUsers() {
+async function readUsers() {
+  if (USE_MONGO) {
+    if (!db) throw new Error("MongoDB is not connected yet");
+    return (await db.collection("users").find({}).toArray()).map(stripId);
+  }
   return readJson(USERS_FILE, []);
 }
 
-function writeUsers(users) {
+async function writeUsers(users) {
+  if (USE_MONGO) return replaceAll("users", users, "id");
   writeJson(USERS_FILE, users);
 }
 
-// Sessions use a signing secret that is generated once and persisted next to the
-// other data files, so existing sessions survive server restarts. Set
-// SESSION_SECRET in the environment to pin a fixed value instead.
-const SESSION_SECRET = process.env.SESSION_SECRET || (() => {
+// One-time migration: if the Mongo database is empty but the local JSON files
+// contain data (an existing local install or a paid Render disk), copy them
+// over so nothing is silently left behind.
+async function migrateJsonOnce() {
+  if (!USE_MONGO) return;
+  const hasTasks = (await db.collection("tasks").countDocuments({})) > 0;
+  if (hasTasks) return;
+  const jsonTasks = readJson(DATA_FILE, []);
+  const jsonUsers = readJson(USERS_FILE, []);
+  const jsonSubs = readJson(SUBS_FILE, []);
+  if (!jsonTasks.length && !jsonUsers.length && !jsonSubs.length) return;
+  if (jsonTasks.length) await writeTasks(jsonTasks);
+  if (jsonUsers.length) await writeUsers(jsonUsers);
+  if (jsonSubs.length) await writeSubs(jsonSubs);
+  console.log(
+    `Imported existing local data into MongoDB: ${jsonTasks.length} task(s), ${jsonUsers.length} user(s), ${jsonSubs.length} subscription(s).`
+  );
+}
+
+// Sessions use a signing secret that is generated once and persisted in the
+// durable store (MongoDB `meta` collection, or data/secret.json), so existing
+// sessions survive server restarts. Set SESSION_SECRET in the environment to
+// pin a fixed value instead. Populated during boot() before listen().
+let SESSION_SECRET = "";
+
+async function getSessionSecret() {
+  if (process.env.SESSION_SECRET) return process.env.SESSION_SECRET;
+  if (USE_MONGO) {
+    const doc = await db.collection("meta").findOne({ _id: "sessionSecret" }, { projection: { value: 1, _id: 0 } });
+    if (doc && typeof doc.value === "string" && doc.value.length >= 32) return doc.value;
+    const secret = crypto.randomBytes(32).toString("hex");
+    // $setOnInsert makes concurrent boots generate the same value.
+    await db.collection("meta").updateOne(
+      { _id: "sessionSecret" },
+      { $setOnInsert: { value: secret } },
+      { upsert: true }
+    );
+    return secret;
+  }
   try {
     const existing = readJson(SECRET_FILE, null);
     if (typeof existing === "string" && existing.length >= 32) return existing;
@@ -160,34 +300,47 @@ const SESSION_SECRET = process.env.SESSION_SECRET || (() => {
   const secret = crypto.randomBytes(32).toString("hex");
   writeJson(SECRET_FILE, secret);
   return secret;
-})();
+}
 
 // ---------- VAPID keys (Web Push) ----------
 
-function getVapidKeys() {
+let vapidKeys = null; // filled during boot() from env / durable store
+
+async function initVapidKeys() {
   // 1. Environment variables win (great for hosted platforms).
   if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
-    return { publicKey: process.env.VAPID_PUBLIC_KEY, privateKey: process.env.VAPID_PRIVATE_KEY };
+    vapidKeys = { publicKey: process.env.VAPID_PUBLIC_KEY, privateKey: process.env.VAPID_PRIVATE_KEY };
+    return;
   }
-  // 2. Otherwise reuse or generate a keypair and persist it in data/.
+  // 2. Otherwise reuse or generate a keypair and persist it durably.
+  if (USE_MONGO) {
+    const doc = await db.collection("meta").findOne({ _id: "vapid" }, { projection: { value: 1, _id: 0 } });
+    if (doc && doc.value && doc.value.publicKey && doc.value.privateKey) {
+      vapidKeys = doc.value;
+      return;
+    }
+    const keys = webpush.generateVAPIDKeys();
+    await db.collection("meta").updateOne({ _id: "vapid" }, { $setOnInsert: { value: keys } }, { upsert: true });
+    vapidKeys = keys;
+    return;
+  }
   if (fs.existsSync(VAPID_FILE)) {
     try {
-      return JSON.parse(fs.readFileSync(VAPID_FILE, "utf8"));
+      vapidKeys = JSON.parse(fs.readFileSync(VAPID_FILE, "utf8"));
+      return;
     } catch (err) {
       /* fall through and regenerate */
     }
   }
   const keys = webpush.generateVAPIDKeys();
-  ensureStore();
+  ensureJsonStore();
   fs.writeFileSync(VAPID_FILE, JSON.stringify(keys, null, 2), "utf8");
+  vapidKeys = keys;
   console.log("Generated new VAPID keys for Web Push (saved to backend/data/vapid.json).");
-  return keys;
 }
 
-const vapidKeys = getVapidKeys();
 const VAPID_SUBJECT =
   process.env.VAPID_SUBJECT || "mailto:taskkeeper@" + (require("os").hostname() || "localhost");
-webpush.setVapidDetails(VAPID_SUBJECT, vapidKeys.publicKey, vapidKeys.privateKey);
 
 // ---------- auth: accounts & sessions ----------
 
@@ -224,13 +377,13 @@ function parseCookies(req) {
   return out;
 }
 
-function currentUser(req) {
+async function currentUser(req) {
   const token = parseCookies(req)[SESSION_COOKIE];
   if (!token) return null;
   try {
     const payload = jwt.verify(token, SESSION_SECRET);
-    const user = readUsers().find((u) => u.id === payload.sub);
-    return user || null;
+    const users = await readUsers();
+    return users.find((u) => u.id === payload.sub) || null;
   } catch (err) {
     return null;
   }
@@ -238,12 +391,27 @@ function currentUser(req) {
 
 // Protect a route: 401 unless a valid session cookie is present. The signed-in
 // user is attached as req.user so task routes can scope data to that account.
-function requireAuth(req, res, next) {
-  const user = currentUser(req);
-  if (!user) return res.status(401).json({ error: "Please sign in to continue." });
-  req.user = user;
-  next();
+async function requireAuth(req, res, next) {
+  try {
+    const user = await currentUser(req);
+    if (!user) return res.status(401).json({ error: "Please sign in to continue." });
+    req.user = user;
+    next();
+  } catch (err) {
+    console.error("Auth storage error:", err && err.message ? err.message : err);
+    return res.status(503).json({ error: "Storage is unavailable. Please try again shortly." });
+  }
 }
+
+// Wrap an async route handler so a storage failure always returns a clean JSON
+// error instead of hanging the request (Express 4 does not await async throws).
+const asyncRoute = (fn) => (req, res) => {
+  Promise.resolve(fn(req, res)).catch((err) => {
+    console.error("Request error:", err && err.stack ? err.stack : err);
+    if (res.headersSent) return res.end();
+    return res.status(500).json({ error: "The server could not save your changes. Please try again." });
+  });
+};
 
 function setSessionCookie(res, userId) {
   const token = jwt.sign({ sub: userId }, SESSION_SECRET, { expiresIn: "30d" });
@@ -379,8 +547,9 @@ function futureDates(dateStr, repeat, maxInstances) {
 
 // ---------- Web Push: subscriptions + reminder scheduler ----------
 
-function removeSubscription(endpoint) {
-  writeSubs(readSubs().filter((s) => s.endpoint !== endpoint));
+async function removeSubscription(endpoint) {
+  const subs = await readSubs();
+  await writeSubs(subs.filter((s) => s.endpoint !== endpoint));
 }
 
 function sendPush(task, time, subs) {
@@ -414,7 +583,7 @@ function sendPush(task, time, subs) {
       if (code === 404 || code === 410) {
         // Gone / no longer valid — drop this device.
         console.log("Removing stale push subscription:", sub.endpoint);
-        removeSubscription(sub.endpoint);
+        removeSubscription(sub.endpoint).catch(() => { /* best-effort cleanup */ });
       } else if (code === 429 || code === 500) {
         console.error(`Push rate-limited/server error (${code}), will retry later.`);
       } else if (code) {
@@ -453,9 +622,9 @@ function clockAtOffset(nowMs, offset) {
   };
 }
 
-function checkDueReminders() {
-  const tasks = readTasks();
-  const subs = readSubs();
+async function checkDueReminders() {
+  const tasks = await readTasks();
+  const subs = await readSubs();
   const nowMs = Date.now();
 
   // If there are no subscribers yet, still check using UTC+0 so the log shows
@@ -505,15 +674,17 @@ function checkDueReminders() {
     }
   }
 
-  if (touched) writeTasks(tasks);
+  if (touched) await writeTasks(tasks);
 }
 
 const PUSH_INTERVAL_MS = Number(process.env.PUSH_INTERVAL_MS || 15000);
 setInterval(() => {
   try {
-    checkDueReminders();
+    checkDueReminders().catch((err) => {
+      console.error("Reminder scheduler error:", err && err.stack ? err.stack : err);
+    });
   } catch (err) {
-    console.error("Reminder scheduler error:", err);
+    console.error("Reminder scheduler error:", err && err.stack ? err.stack : err);
   }
 }, PUSH_INTERVAL_MS);
 
@@ -524,7 +695,7 @@ app.get("/api/push/public-key", (req, res) => {
 
 // Register a push subscription (one per device/browser) and tie it to the
 // signed-in account so reminders only reach that user's devices.
-app.post("/api/subscribe", subscribeLimiter, requireAuth, (req, res) => {
+app.post("/api/subscribe", subscribeLimiter, requireAuth, asyncRoute(async (req, res) => {
   const body = req.body || {};
   const endpoint = typeof body.endpoint === "string" ? body.endpoint.trim() : "";
   const keys = body.keys && typeof body.keys === "object" ? body.keys : {};
@@ -548,7 +719,7 @@ app.post("/api/subscribe", subscribeLimiter, requireAuth, (req, res) => {
     utcOffsetMinutes = n;
   }
 
-  const subs = readSubs();
+  const subs = await readSubs();
   const existing = subs.find((s) => s.endpoint === endpoint);
   if (existing) {
     // Re-subscribing on a later app load: keep the device, but refresh its
@@ -560,7 +731,7 @@ app.post("/api/subscribe", subscribeLimiter, requireAuth, (req, res) => {
       existing.utcOffsetMinutes = Number(body.utcOffsetMinutes);
     }
     existing.lastSeenAt = new Date().toISOString();
-    writeSubs(subs);
+    await writeSubs(subs);
     return res.json({ ok: true, already: true, offsetUpdated: existing.utcOffsetMinutes });
   }
   if (subs.length >= MAX_SUBSCRIPTIONS) {
@@ -575,21 +746,22 @@ app.post("/api/subscribe", subscribeLimiter, requireAuth, (req, res) => {
     keys: { p256dh: keys.p256dh, auth: keys.auth },
     createdAt: new Date().toISOString(),
   });
-  writeSubs(subs);
+  await writeSubs(subs);
   res.status(201).json({ ok: true });
-});
+}));
 
 // Unregister a push subscription (called by the app when notifications are off).
-app.post("/api/unsubscribe", requireAuth, (req, res) => {
+app.post("/api/unsubscribe", requireAuth, asyncRoute(async (req, res) => {
   const endpoint = req.body && typeof req.body.endpoint === "string" ? req.body.endpoint.trim() : "";
   if (!endpoint) return res.status(400).json({ error: "endpoint is required" });
-  writeSubs(readSubs().filter((s) => !(s.endpoint === endpoint && s.owner === req.user.id)));
+  const subs = await readSubs();
+  await writeSubs(subs.filter((s) => !(s.endpoint === endpoint && s.owner === req.user.id)));
   res.json({ ok: true });
-});
+}));
 
 // ---------- auth routes ----------
 
-app.post("/api/auth/signup", (req, res) => {
+app.post("/api/auth/signup", asyncRoute(async (req, res) => {
   const body = req.body || {};
   const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
   if (!EMAIL_RE.test(email) || email.length > 254) {
@@ -599,7 +771,7 @@ app.post("/api/auth/signup", (req, res) => {
     return res.status(400).json({ error: "Password must be 8–72 characters." });
   }
 
-  const users = readUsers();
+  const users = await readUsers();
   if (users.some((u) => u.email === email)) {
     return res.status(409).json({ error: "An account with that email already exists — try signing in." });
   }
@@ -611,11 +783,11 @@ app.post("/api/auth/signup", (req, res) => {
     createdAt: new Date().toISOString(),
   };
   users.push(user);
-  writeUsers(users);
+  await writeUsers(users);
 
   // Tasks created before accounts existed have no owner. The first person to
   // create an account keeps that earlier data so nothing is lost.
-  const tasks = readTasks();
+  const tasks = await readTasks();
   let adopted = 0;
   for (const t of tasks) {
     if (!t.owner) {
@@ -623,56 +795,59 @@ app.post("/api/auth/signup", (req, res) => {
       adopted += 1;
     }
   }
-  if (adopted > 0) writeTasks(tasks);
+  if (adopted > 0) await writeTasks(tasks);
 
   setSessionCookie(res, user.id);
   console.log(`[auth] signup ${user.email} (adopted ${adopted} legacy task(s))`);
   res.status(201).json({ user: publicUser(user) });
-});
+}));
 
-app.post("/api/auth/login", (req, res) => {
+app.post("/api/auth/login", asyncRoute(async (req, res) => {
   const body = req.body || {};
   const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
   const password = typeof body.password === "string" ? body.password : "";
-  const user = readUsers().find((u) => u.email === email);
+  const users = await readUsers();
+  const user = users.find((u) => u.email === email);
   if (!user || !bcrypt.compareSync(password, user.passwordHash)) {
     return res.status(401).json({ error: "Incorrect email or password." });
   }
   setSessionCookie(res, user.id);
   console.log(`[auth] login ${user.email}`);
   res.json({ user: publicUser(user) });
-});
+}));
 
 app.post("/api/auth/logout", (req, res) => {
   clearSessionCookie(res);
   res.json({ ok: true });
 });
 
-app.get("/api/auth/me", (req, res) => {
-  const user = currentUser(req);
+app.get("/api/auth/me", asyncRoute(async (req, res) => {
+  const user = await currentUser(req);
   if (!user) return res.status(401).json({ error: "Not signed in." });
   res.json({ user: publicUser(user) });
-});
+}));
 
 // ---------- API routes: tasks ----------
 
 // Used by Render to verify that both the HTTP server and its writable store
 // are available before directing users to this instance.
-app.get("/api/health", (req, res) => {
+app.get("/api/health", asyncRoute(async (req, res) => {
   try {
-    ensureStore();
-    fs.accessSync(DATA_DIR, fs.constants.R_OK | fs.constants.W_OK);
-    res.json({ ok: true });
+    await ensureStore();
+    if (!USE_MONGO) {
+      fs.accessSync(DATA_DIR, fs.constants.R_OK | fs.constants.W_OK);
+    }
+    res.json({ ok: true, storage: USE_MONGO ? "mongodb" : "json-file" });
   } catch (err) {
-    console.error("Storage health check failed:", err);
+    console.error("Storage health check failed:", err && err.stack ? err.stack : err);
     res.status(503).json({ ok: false, error: "task storage is unavailable" });
   }
-});
+}));
 
 // List tasks for the signed-in user. Optional ?date=YYYY-MM-DD to filter to one day.
-app.get("/api/tasks", requireAuth, (req, res) => {
+app.get("/api/tasks", requireAuth, asyncRoute(async (req, res) => {
   const { date } = req.query;
-  let tasks = tasksForUser(req.user.id);
+  let tasks = await tasksForUser(req.user.id);
   if (date) {
     if (!isValidDate(date)) {
       return res.status(400).json({ error: "date must be in YYYY-MM-DD format" });
@@ -682,17 +857,17 @@ app.get("/api/tasks", requireAuth, (req, res) => {
   const timeOf = (t) => (t.time || t.startTime || "23:59");
   tasks.sort((a, b) => timeOf(a).localeCompare(timeOf(b)));
   res.json(tasks);
-});
+}));
 
 // Dates that have at least one task, with a count — used to mark the calendar.
-app.get("/api/tasks/summary", requireAuth, (req, res) => {
-  const tasks = tasksForUser(req.user.id);
+app.get("/api/tasks/summary", requireAuth, asyncRoute(async (req, res) => {
+  const tasks = await tasksForUser(req.user.id);
   const counts = {};
   for (const t of tasks) counts[t.date] = (counts[t.date] || 0) + 1;
   res.json(counts);
-});
+}));
 
-app.post("/api/tasks", requireAuth, (req, res) => {
+app.post("/api/tasks", requireAuth, asyncRoute(async (req, res) => {
   const body = req.body || {};
   const { date, title, time, startTime, endTime, notes, snoozeMinutes, repeat } = body;
 
@@ -725,7 +900,7 @@ app.post("/api/tasks", requireAuth, (req, res) => {
     return res.status(400).json({ error: "repeat must be none, daily or weekly" });
   }
 
-  const tasks = readTasks();
+  const tasks = await readTasks();
   const fields = {
     owner: req.user.id,
     date,
@@ -749,13 +924,13 @@ app.post("/api/tasks", requireAuth, (req, res) => {
     }
   }
 
-  writeTasks(tasks);
+  await writeTasks(tasks);
   res.status(201).json({ task, created: 1 + extraCount });
-});
+}));
 
-app.put("/api/tasks/:id", requireAuth, (req, res) => {
+app.put("/api/tasks/:id", requireAuth, asyncRoute(async (req, res) => {
   const { id } = req.params;
-  const tasks = readTasks();
+  const tasks = await readTasks();
   const idx = tasks.findIndex((t) => t.id === id && t.owner === req.user.id);
   if (idx === -1) return res.status(404).json({ error: "task not found" });
 
@@ -800,20 +975,20 @@ app.put("/api/tasks/:id", requireAuth, (req, res) => {
 
   updated.reminders = remindersForTask(updated.time, updated.startTime, updated.endTime, updated.snoozeMinutes);
   tasks[idx] = updated;
-  writeTasks(tasks);
+  await writeTasks(tasks);
   res.json(updated);
-});
+}));
 
-app.delete("/api/tasks/:id", requireAuth, (req, res) => {
+app.delete("/api/tasks/:id", requireAuth, asyncRoute(async (req, res) => {
   const { id } = req.params;
-  const tasks = readTasks();
+  const tasks = await readTasks();
   const next = tasks.filter((t) => !(t.id === id && t.owner === req.user.id));
   if (next.length === tasks.length) {
     return res.status(404).json({ error: "task not found" });
   }
-  writeTasks(next);
+  await writeTasks(next);
   res.status(204).end();
-});
+}));
 
 // ---------- serve the frontend ----------
 
@@ -837,11 +1012,33 @@ app.get("*", (req, res, next) => {
 
 // ---------- start ----------
 
-ensureStore();
-app.listen(PORT, () => {
-  console.log(`Task Keeper running at http://localhost:${PORT}`);
-  console.log(`Web Push public key: ${vapidKeys.publicKey.slice(0, 24)}…`);
-});
+async function boot() {
+  try {
+    if (USE_MONGO) await connectMongo();
+    await ensureStore();
+    SESSION_SECRET = await getSessionSecret();
+    await initVapidKeys();
+    webpush.setVapidDetails(VAPID_SUBJECT, vapidKeys.publicKey, vapidKeys.privateKey);
+    await migrateJsonOnce();
+    console.log(
+      USE_MONGO
+        ? `Storage: MongoDB ("${MONGO_DB_NAME}") — data is durable across restarts.`
+        : `Storage: local JSON files in ${DATA_DIR} — for local development only; set MONGODB_URI to persist on hosted platforms.`
+    );
+  } catch (err) {
+    console.error("Storage failed to initialise:", err && err.stack ? err.stack : err);
+    if (USE_MONGO) {
+      console.error("Check that MONGODB_URI is correct and the database is reachable (and allow-listed by IP if applicable).");
+    }
+    process.exit(1); // fail fast — never serve while the durable store is unavailable
+  }
+  app.listen(PORT, () => {
+    console.log(`Task Keeper running at http://localhost:${PORT}`);
+    console.log(`Web Push public key: ${vapidKeys.publicKey.slice(0, 24)}…`);
+  });
+}
+
+boot();
 
 // Always return JSON for API errors. The client can then show a useful save
 // error instead of the unhelpful "Unexpected token <" from an HTML error page.

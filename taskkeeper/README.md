@@ -29,7 +29,9 @@ computed automatically from the times you set.
 - **Security.** Helmet security headers + CSP, API rate limiting, strict input validation,
   restricted CORS, no exposed server internals.
 - **Deployment-ready.** Dockerfile included; deploy on Render, Railway, Fly.io, a VPS, or
-  any Node host. Data persists in `backend/data/` (tasks, push subscriptions, VAPID keys).
+  any Node host. Set `MONGODB_URI` to a managed MongoDB (e.g. free MongoDB Atlas) and all
+  data is stored securely in the database — no persistent disk or volume needed. Without
+  it, data persists locally in `backend/data/` (tasks, push subscriptions, VAPID keys).
 
 ## What's inside
 
@@ -47,8 +49,11 @@ taskkeeper/
 └── README.md
 ```
 
-There is no database server to install — everything is stored in `backend/data/`.
-One process serves both the API and the web page, so there's only one thing to start.
+There is no separate database install needed for local development — data is stored in
+`backend/data/`. For hosted deploys you can (and on hosts with an ephemeral filesystem,
+*survival depends on it*) point the app at a managed MongoDB via the `MONGODB_URI`
+environment variable; everything then lives in the database. One process serves both the
+API and the web page, so there's only one thing to start.
 
 ## Run it locally
 
@@ -103,15 +108,41 @@ Phone browsers only allow push notifications from a **secure HTTPS** origin (not
 
 ## Deploying it
 
+> **Before you deploy to a hosted platform, create a database.** The app can store data in
+> local JSON files (fine for local development only) or in a managed MongoDB. Hosts like
+> Render's free tier use an **ephemeral filesystem** — anything saved to local files is
+> erased whenever the instance restarts or redeploys. With `MONGODB_URI` set, all data
+> lives in the database and survives restarts, redeploys and instance changes.
+
+### Step 0 — Get a free MongoDB database (2 minutes)
+
+1. Create a free **M0** cluster at [MongoDB Atlas](https://www.mongodb.com/cloud/atlas)
+   (512 MB of storage — plenty for a task list).
+2. Under **Database Access**, add a user with read/write access.
+3. Under **Network Access**, click **Add IP Address** → **Allow access from anywhere**
+   (`0.0.0.0/0`). This is fine because Atlas still requires the username/password, TLS,
+   and the API key; for extra security you can instead allow Render's egress IP later.
+4. Click **Connect → Drivers** and copy the connection string, e.g.
+   `mongodb+srv://user:pass@cluster0.mongodb.net/taskkeeper?retryWrites=true&w=majority`.
+   Give the web service the `MONGODB_URI` environment variable with this value
+   (on Render: Dashboard → your service → **Environment**).
+
+On first boot the backend creates its collections, indexes, VAPID keys and session secret
+automatically. If `backend/data/*.json` already contains data from a previous run, it is
+imported into MongoDB once.
+
 ### Option A — Docker (works on any VPS, Render, Railway, Fly.io)
 
 ```bash
 docker build -t dayline .
-docker run -d -p 4000:4000 -v dayline-data:/app/backend/data dayline
+docker run -d -p 4000:4000 -e MONGODB_URI=mongodb+srv://... dayline
 ```
 
-Make sure `backend/data` is a persistent volume, otherwise tasks/subscriptions are lost on
-restart.
+Without `MONGODB_URI`, mount a persistent volume instead:
+
+```bash
+docker run -d -p 4000:4000 -v dayline-data:/app/backend/data dayline
+```
 
 ### Option B — Render (recommended)
 
@@ -120,11 +151,10 @@ and choose this repository. It deploys one Docker-based **Web Service**, not a
 Static Site, so the website and `/api/tasks` API always use the same HTTPS
 origin on desktop and mobile.
 
-The Blueprint attaches a 1 GB persistent disk at `/app/backend/data`, where
-the app stores tasks, push subscriptions, and VAPID keys. Keep the service at
-one instance: JSON-file storage is intentionally single-instance. Render
-persistent disks require a paid web-service plan. A free service can run the
-app, but its saved tasks are erased whenever Render restarts or redeploys it.
+Then, on the web service: add `MONGODB_URI` under **Environment** and redeploy.
+The free plan works fine — a persistent disk is **not** needed because data is
+stored in MongoDB, not on the instance's filesystem. Keep the service at one
+instance: the app is intentionally single-instance.
 
 After the deploy is live, open the Render URL on a phone or computer. On iPhone,
 use Safari's **Share → Add to Home Screen** before enabling notifications.
@@ -153,9 +183,12 @@ for phone notifications.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
+| `MONGODB_URI` | *(unset)* | **Recommended for hosted deploys.** Managed MongoDB connection string, e.g. `mongodb+srv://user:pass@cluster.mongodb.net/taskkeeper`. When set, all data is stored durably in the database; otherwise local JSON files are used |
+| `MONGODB_DB` | database name from the URI, else `taskkeeper` | MongoDB database name to use |
+| `MONGODB_TLS` | `mongodb+srv://` → on, else off | Force TLS for self-hosted MongoDB (set `true`) |
 | `PORT` | `4000` | HTTP port the server listens on |
-| `DATA_DIR` | `backend/data` | directory for tasks, subscriptions, users, and VAPID keys; set this to a persistent disk path on a host |
-| `SESSION_SECRET` | auto-generated, saved to `data/secret.json` | secret used to sign login session cookies |
+| `DATA_DIR` | `backend/data` | directory for tasks, subscriptions, users, and VAPID keys (JSON-file mode only) |
+| `SESSION_SECRET` | auto-generated, stored in the database / `data/secret.json` | secret used to sign login session cookies |
 | `VAPID_PUBLIC_KEY` | auto-generated | Web Push public key (base64url) |
 | `VAPID_PRIVATE_KEY` | auto-generated | Web Push private key (base64url) |
 | `VAPID_SUBJECT` | mailto from hostname | contact URL/mailto for the push service |

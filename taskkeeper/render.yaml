@@ -2,12 +2,7 @@ services:
   - type: web
     name: taskkeeper
     runtime: docker
-    plan: 0.5c-512mb
     dockerfilePath: ./Dockerfile
     dockerContext: .
     healthCheckPath: /api/health
     numInstances: 1
-    disk:
-      name: taskkeeper-data
-      mountPath: /app/backend/data
-      sizeGB: 1
