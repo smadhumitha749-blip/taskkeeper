@@ -78,6 +78,15 @@
           <input type="text" id="title" placeholder="Write the proposal" required maxlength="120" />
         </label>
 
+        <label class="field">
+          <span>Priority</span>
+          <select id="priority">
+            <option value="low">Low</option>
+            <option value="medium" selected>Medium</option>
+            <option value="high">High</option>
+          </select>
+        </label>
+
         <div class="field-row">
           <label class="field">
             <span>Time <em>(optional)</em></span>
@@ -100,7 +109,7 @@
           <select id="repeat">
             <option value="none">Doesn't repeat</option>
             <option value="daily">Daily</option>
-            <option value="weekly">Weekly</option>
+            <option value="weekly">Weekly (Mon–Fri)</option>
           </select>
         </label>
 
@@ -166,6 +175,23 @@
       <button id="tasksModalClose" class="modal-close" type="button" aria-label="Close">×</button>
     </div>
     <div class="modal-body" id="tasksModalBody"></div>
+  </div>
+</div>
+
+<div class="modal-overlay confirm-overlay" id="confirmModal" hidden>
+  <div class="modal" role="alertdialog" aria-modal="true" aria-label="Delete repeating task">
+    <div class="modal-header">
+      <h2>Delete repeating task</h2>
+      <button id="confirmClose" class="modal-close" type="button" aria-label="Close">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="confirm-text" id="confirmText"></p>
+      <div class="confirm-actions">
+        <button id="confirmThisDay" class="danger-btn" type="button">Delete this day only</button>
+        <button id="confirmAllDays" class="danger-btn" type="button">Delete this and all future days</button>
+        <button id="confirmCancel" class="secondary-btn" type="button">Cancel</button>
+      </div>
+    </div>
   </div>
 </div>
 

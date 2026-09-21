@@ -33,6 +33,7 @@ const AUTH = "/api/auth";
 
     form: document.getElementById("taskForm"),
     title: document.getElementById("title"),
+    priority: document.getElementById("priority"),
     time: document.getElementById("time"),
     snooze: document.getElementById("snooze"),
     repeat: document.getElementById("repeat"),
@@ -50,6 +51,13 @@ const AUTH = "/api/auth";
     tasksModal: document.getElementById("tasksModal"),
     tasksModalClose: document.getElementById("tasksModalClose"),
     tasksModalBody: document.getElementById("tasksModalBody"),
+
+    confirmModal: document.getElementById("confirmModal"),
+    confirmText: document.getElementById("confirmText"),
+    confirmThisDay: document.getElementById("confirmThisDay"),
+    confirmAllDays: document.getElementById("confirmAllDays"),
+    confirmCancel: document.getElementById("confirmCancel"),
+    confirmClose: document.getElementById("confirmClose"),
 
     dayOfWeek: document.getElementById("dayOfWeek"),
     selectedDateLabel: document.getElementById("selectedDateLabel"),
@@ -146,6 +154,28 @@ const AUTH = "/api/auth";
       reminders.push(`${h}:${m}`);
     }
     return reminders.length ? reminders : [startTime];
+  }
+
+  // ---------- task priority (low / medium / high) ----------
+
+  // className feeds the CSS dot colour (green/yellow/red); dot is a coloured
+  // circle emoji used in OS notifications so the priority is visible on phone
+  // and desktop lock screens.
+  const PRIORITY_INFO = {
+    low: { label: "Low", dot: "\u{1F7E2}", className: "low" },
+    medium: { label: "Medium", dot: "\u{1F7E1}", className: "medium" },
+    high: { label: "High", dot: "\u{1F534}", className: "high" },
+  };
+
+  function priorityOf(task) {
+    return (task && PRIORITY_INFO[task.priority]) || PRIORITY_INFO.medium;
+  }
+
+  // Repeat display helper: "weekly" in this app means every weekday (Mon–Fri).
+  function repeatLabel(repeat) {
+    if (repeat === "daily") return "daily";
+    if (repeat === "weekly") return "weekdays (Mon–Fri)";
+    return "";
   }
   // ---------- calendar ----------
 
@@ -342,17 +372,19 @@ const AUTH = "/api/auth";
         block.className = "task-block" + (task.done ? " is-done" : "");
         block.style.top = `${top}px`;
         block.style.height = `${height}px`;
+        const prio = priorityOf(task);
         block.innerHTML = `
-        <strong>${escapeHtml(task.title)}</strong>
+        <strong><span class="priority-dot ${prio.className}" title="Priority: ${prio.label}"></span>${escapeHtml(task.title)}</strong>
         <span class="task-time">${to12h(task.startTime)} – ${to12h(task.endTime)}</span>
       `;
       } else {
         // Single-time event: a compact pill centered on that time.
         block.className = "task-pill" + (task.done ? " is-done" : "");
         block.style.top = `${top - 8}px`;
+        const prio = priorityOf(task);
         block.innerHTML = `
         <span class="pill-time">${to12h(task.time)}</span>
-        <strong>${escapeHtml(task.title)}</strong>
+        <strong><span class="priority-dot ${prio.className}" title="Priority: ${prio.label}"></span>${escapeHtml(task.title)}</strong>
       `;
       }
       el.timeline.appendChild(block);
@@ -402,10 +434,14 @@ const AUTH = "/api/auth";
         : task.startTime && task.endTime
           ? `${to12h(task.startTime)} – ${to12h(task.endTime)}`
           : "Any time";
-      const repeatText = task.repeat && task.repeat !== "none" ? ` · repeats ${task.repeat}` : "";
+      const repeatText = task.repeat && task.repeat !== "none" ? ` · repeats ${repeatLabel(task.repeat)}` : "";
+      const prio = priorityOf(task);
       body.innerHTML = `
         <div class="agenda-time">${taskTimeText}${repeatText}</div>
-        <h3>${escapeHtml(task.title)}</h3>
+        <div class="agenda-title-row">
+          <span class="priority-dot ${prio.className}" title="Priority: ${prio.label}" aria-label="Priority: ${prio.label}"></span>
+          <h3>${escapeHtml(task.title)}</h3>
+        </div>
         ${task.notes ? `<p>${escapeHtml(task.notes)}</p>` : ""}
         <div class="agenda-reminders">${remindersHtml}</div>
       `;
@@ -415,7 +451,7 @@ const AUTH = "/api/auth";
       del.type = "button";
       del.setAttribute("aria-label", "Delete task");
       del.textContent = "×";
-      del.addEventListener("click", () => deleteTask(task.id));
+      del.addEventListener("click", () => deleteTask(task));
 
       item.appendChild(check);
       item.appendChild(body);
@@ -440,6 +476,7 @@ const AUTH = "/api/auth";
     const payload = {
       date: selectedDate,
       title: el.title.value,
+      priority: el.priority.value,
       time: el.time.value || null,
       snoozeMinutes: Number(el.snooze.value) || 0,
       repeat: el.repeat.value,
@@ -485,15 +522,68 @@ const AUTH = "/api/auth";
     }
   }
 
-  async function deleteTask(id) {
+  // Repeating (daily/weekly) tasks exist as one copy per calendar day, so
+  // deleting one needs a choice: remove just today's copy, or the whole series
+  // (this and every future day of the repeat). Single tasks delete directly.
+  let pendingDeleteTask = null;
+
+  function openDeleteConfirm(task) {
+    pendingDeleteTask = task;
+    const every = task.repeat === "daily" ? "every day" : "every weekday (Monday–Friday)";
+    el.confirmText.textContent =
+      `"${task.title}" repeats ${every}. Delete just this occurrence, or this and all future copies?`;
+    el.confirmModal.hidden = false;
+  }
+
+  function closeDeleteConfirm() {
+    el.confirmModal.hidden = true;
+    pendingDeleteTask = null;
+  }
+
+  async function apiDeleteTask(id) {
     try {
-      await fetch(`${API}/${id}`, { method: "DELETE" });
+      const res = await fetch(`${API}/${id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(await responseError(res, "Could not delete task"));
       await loadSummary();
       await loadDay();
     } catch (err) {
       console.error("Could not delete task", err);
     }
   }
+
+  async function deleteTask(task) {
+    if (task.repeat && task.repeat !== "none") {
+      openDeleteConfirm(task);
+      return;
+    }
+    await apiDeleteTask(task.id);
+  }
+
+  el.confirmThisDay.addEventListener("click", async () => {
+    const task = pendingDeleteTask;
+    closeDeleteConfirm();
+    if (task) await apiDeleteTask(task.id);
+  });
+
+  el.confirmAllDays.addEventListener("click", async () => {
+    const task = pendingDeleteTask;
+    closeDeleteConfirm();
+    if (!task) return;
+    try {
+      const res = await fetch(`${API}/series/${task.id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(await responseError(res, "Could not delete task series"));
+      await loadSummary();
+      await loadDay();
+    } catch (err) {
+      console.error("Could not delete task series", err);
+    }
+  });
+
+  el.confirmCancel.addEventListener("click", closeDeleteConfirm);
+  el.confirmClose.addEventListener("click", closeDeleteConfirm);
+  el.confirmModal.addEventListener("click", (event) => {
+    if (event.target === el.confirmModal) closeDeleteConfirm();
+  });
   // ---------- toasts, sound & in-page reminders ----------
 
   function showToast(title, body) {
@@ -628,12 +718,15 @@ const AUTH = "/api/auth";
       : eventTime
         ? `${to12h(eventTime)}${task.snoozeMinutes ? ` · early ${task.snoozeMinutes}m` : ""}`
         : "Anytime";
-    const body = `${whenText} · reminder for ${to12h(reminderTime)}`;
+    // Coloured dot + label make the priority visible in the OS notification
+    // next to the task name (title) and the reminder time.
+    const prio = priorityOf(task);
+    const body = `${prio.dot} ${prio.label} · ${whenText} · reminder for ${to12h(reminderTime)}`;
     playReminderSound();
     vibrateDevice();
 
     if (window.Notification && Notification.permission === "granted") {
-      showLocalNotification(task.title, body, key).then((shown) => {
+      showLocalNotification(`${prio.dot} ${task.title}`, body, key).then((shown) => {
         if (!shown) showToast(task.title, body);
       });
     } else {
@@ -731,9 +824,10 @@ const AUTH = "/api/auth";
     const whenText = p.startTime && p.endTime
       ? `${to12h(p.startTime)}–${to12h(p.endTime)}`
       : `${to12h(p.time || nowHHMM())}`;
+    const prio = PRIORITY_INFO[p.priority] || PRIORITY_INFO.medium;
     playReminderSound();
     vibrateDevice();
-    showToast(p.title || "Dayline reminder", `${whenText} · reminder for ${to12h(p.time || nowHHMM())}`);
+    showToast(p.title || "Dayline reminder", `${prio.dot} ${prio.label} · ${whenText} · reminder for ${to12h(p.time || nowHHMM())}`);
   }
 
   async function setupNotifications() {
@@ -806,7 +900,7 @@ const AUTH = "/api/auth";
 
   // ---------- installable PWA prompt ----------
 
-  const APP_VERSION = "2.5";
+  const APP_VERSION = "2.6";
 
   // Force a service-worker update check so everyone receives the latest fix
   // without waiting for the browser's default (often slow) refresh cycle.
@@ -823,7 +917,7 @@ const AUTH = "/api/auth";
     if (localStorage.getItem("dayline.version") !== APP_VERSION) {
       localStorage.setItem("dayline.version", APP_VERSION);
       setTimeout(() => {
-        showToast("Dayline updated", `Now running version ${APP_VERSION} — reminder sound fixed, vibration on mobile, and cross-device sync.`);
+        showToast("Dayline updated", `Now running version ${APP_VERSION} — task priority dots, per-day/all-days delete for repeating tasks, and priority + time shown in lock-screen notifications.`);
       }, 1200);
     }
   } catch (err) {
@@ -910,9 +1004,10 @@ const AUTH = "/api/auth";
         : task.startTime && task.endTime
           ? `${to12h(task.startTime)} – ${to12h(task.endTime)}`
           : "";
-      const repeatText = task.repeat && task.repeat !== "none" ? ` · ${task.repeat}` : "";
+      const repeatText = task.repeat && task.repeat !== "none" ? ` · ${repeatLabel(task.repeat)}` : "";
+      const prio = priorityOf(task);
       text.innerHTML =
-        `<strong>${escapeHtml(task.title)}</strong>` +
+        `<strong><span class="priority-dot ${prio.className}" title="Priority: ${prio.label}"></span>${escapeHtml(task.title)}</strong>` +
         (timeText ? `<span>${escapeHtml(timeText)}${escapeHtml(repeatText)}</span>` : "");
 
       const del = document.createElement("button");
@@ -920,7 +1015,7 @@ const AUTH = "/api/auth";
       del.type = "button";
       del.setAttribute("aria-label", "Delete task");
       del.textContent = "×";
-      del.addEventListener("click", () => deleteTask(task.id));
+      del.addEventListener("click", () => deleteTask(task));
 
       row.appendChild(check);
       row.appendChild(text);
@@ -943,7 +1038,12 @@ const AUTH = "/api/auth";
     if (event.target === el.tasksModal) closeTasksModal();
   });
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && !el.tasksModal.hidden) closeTasksModal();
+    if (event.key !== "Escape") return;
+    if (!el.confirmModal.hidden) {
+      closeDeleteConfirm();
+      return;
+    }
+    if (!el.tasksModal.hidden) closeTasksModal();
   });
 
   function updateTasksBadge() {

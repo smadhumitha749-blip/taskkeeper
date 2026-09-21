@@ -481,6 +481,15 @@ function sanitizeNotes(notes) {
 
 const SNOOZE_OPTIONS = new Set([0, 2, 3, 5, 10]);
 const REPEAT_MODES = new Set(["none", "daily", "weekly"]);
+const PRIORITIES = new Set(["low", "medium", "high"]);
+// Shown in OS push notifications (title/body) so the priority colour + name +
+// time are visible on the phone and desktop even on the lock screen. The dot
+// is a coloured-circle emoji that renders natively on Android/Windows/macOS/iOS.
+const PRIORITY_LABELS = {
+  low: { label: "Low", dot: "\u{1F7E2}" },    // 🟢 green
+  medium: { label: "Medium", dot: "\u{1F7E1}" }, // 🟡 yellow
+  high: { label: "High", dot: "\u{1F534}" },  // 🔴 red
+};
 // How many future instances a repeating task gets materialized into.
 const REPEAT_FORWARD_DAILY = Number(process.env.REPEAT_DAILY_DAYS || 60);
 const REPEAT_FORWARD_WEEKLY = Number(process.env.REPEAT_WEEKLY_WEEKS || 13);
@@ -517,6 +526,7 @@ function buildTask(fields) {
     date: fields.date,
     title: fields.title.trim(),
     notes: sanitizeNotes(fields.notes),
+    priority: PRIORITIES.has(fields.priority) ? fields.priority : "medium",
     time: fields.time && isValidTime(fields.time) ? fields.time : null,
     startTime: fields.startTime && isValidTime(fields.startTime) ? fields.startTime : null,
     endTime: fields.endTime && isValidTime(fields.endTime) ? fields.endTime : null,
@@ -525,22 +535,31 @@ function buildTask(fields) {
     reminders: [],
     createdAt: new Date().toISOString(),
   };
+  // Repeating tasks share one seriesId across every materialized instance
+  // (today + the copies generated for future days). The server uses it to
+  // delete "all days" of a repeating series in one go.
+  if (fields.seriesId) task.seriesId = fields.seriesId;
   task.reminders = remindersForTask(task.time, task.startTime, task.endTime, task.snoozeMinutes);
   return task;
 }
 
 // For daily/weekly repeat, materialize future copies so the mini-calendar shows
-// them, the scheduler pushes them, and past days keep their history.
+// them, the scheduler pushes them, and past days keep their history. "Weekly"
+// repeat means every weekday (Monday–Friday): weekend dates are skipped, so a
+// weekly task created on, say, a Wednesday appears Wed, Thu, Fri, then the
+// following Mon/Tue/Wed… and never lands on Saturday or Sunday.
 function futureDates(dateStr, repeat, maxInstances) {
   const out = [];
   if (repeat !== "daily" && repeat !== "weekly") return out;
-  const step = repeat === "daily" ? 1 : 7;
   const d = new Date(dateStr + "T00:00:00");
-  d.setDate(d.getDate() + step);
   const cap = new Date(d.getTime() + 400 * 86400000).getTime();
-  for (let i = 0; i < maxInstances && d.getTime() <= cap; i++) {
-    out.push(formatDate(d));
-    d.setDate(d.getDate() + step);
+  d.setDate(d.getDate() + 1); // the first copy is the day after creation
+  for (let i = 0; i < maxInstances && d.getTime() <= cap; ) {
+    if (repeat === "daily" || (d.getDay() !== 0 && d.getDay() !== 6)) {
+      out.push(formatDate(d));
+      i++;
+    }
+    d.setDate(d.getDate() + 1);
   }
   return out;
 }
@@ -562,9 +581,13 @@ function sendPush(task, time, subs) {
     : eventTime
       ? `${to12h(eventTime)}${task.snoozeMinutes ? ` · early ${task.snoozeMinutes}m` : ""}`
       : "Anytime";
+  // Coloured priority dot + label + time go straight into the notification
+  // text so the task name (title) and priority colour and time are visible on
+  // both mobile and desktop lock screens.
+  const prio = PRIORITY_LABELS[task.priority] || PRIORITY_LABELS.medium;
   const payload = {
     title: task.title,
-    body: `${whenText} · Reminder for ${to12h(time)}`,
+    body: `${prio.dot} ${prio.label} · ${whenText} · Reminder for ${to12h(time)}`,
     tag: `${task.id}|${task.date}|${time}`,
     icon: "/icons/icon-192.png",
     badge: "/icons/icon-192.png",
@@ -573,6 +596,7 @@ function sendPush(task, time, subs) {
     time,
     startTime: task.startTime || null,
     endTime: task.endTime || null,
+    priority: task.priority && PRIORITY_LABELS[task.priority] ? task.priority : "medium",
   };
   const json = JSON.stringify(payload);
   let failed = 0;
@@ -870,7 +894,7 @@ app.get("/api/tasks/summary", requireAuth, asyncRoute(async (req, res) => {
 
 app.post("/api/tasks", requireAuth, asyncRoute(async (req, res) => {
   const body = req.body || {};
-  const { date, title, time, startTime, endTime, notes, snoozeMinutes, repeat } = body;
+  const { date, title, time, startTime, endTime, notes, snoozeMinutes, repeat, priority } = body;
 
   if (!isValidDate(date)) {
     return res.status(400).json({ error: "date is required as YYYY-MM-DD" });
@@ -900,6 +924,9 @@ app.post("/api/tasks", requireAuth, asyncRoute(async (req, res) => {
   if (repeat !== undefined && repeat !== null && repeat !== "" && !REPEAT_MODES.has(repeat)) {
     return res.status(400).json({ error: "repeat must be none, daily or weekly" });
   }
+  if (priority !== undefined && priority !== null && priority !== "" && !PRIORITIES.has(priority)) {
+    return res.status(400).json({ error: "priority must be low, medium or high" });
+  }
 
   const tasks = await readTasks();
   const fields = {
@@ -907,6 +934,7 @@ app.post("/api/tasks", requireAuth, asyncRoute(async (req, res) => {
     date,
     title,
     notes,
+    priority: PRIORITIES.has(priority) ? priority : "medium",
     time: hasTime ? time : null,
     startTime: hasRange ? startTime : null,
     endTime: hasRange ? endTime : null,
@@ -915,13 +943,22 @@ app.post("/api/tasks", requireAuth, asyncRoute(async (req, res) => {
   };
 
   const task = buildTask(fields);
+  // A repeating task anchors its series: every copy generated below shares the
+  // anchor's id as seriesId, so later "delete all days" can find the whole run.
+  if (fields.repeat !== "none") task.seriesId = task.id;
   tasks.push(task);
 
   const extraCount =
-    fields.repeat === "daily" ? REPEAT_FORWARD_DAILY : fields.repeat === "weekly" ? REPEAT_FORWARD_WEEKLY : 0;
+    fields.repeat === "daily"
+      ? REPEAT_FORWARD_DAILY
+      : fields.repeat === "weekly"
+        ? REPEAT_FORWARD_WEEKLY * 5 // weekdays only (Mon–Fri), same ~13-week horizon
+        : 0;
   if (extraCount > 0) {
     for (const fd of futureDates(date, fields.repeat, extraCount)) {
-      tasks.push(buildTask({ ...fields, date: fd }));
+      const copy = buildTask({ ...fields, date: fd });
+      copy.seriesId = task.id;
+      tasks.push(copy);
     }
   }
 
@@ -936,12 +973,13 @@ app.put("/api/tasks/:id", requireAuth, asyncRoute(async (req, res) => {
   if (idx === -1) return res.status(404).json({ error: "task not found" });
 
   const existing = tasks[idx];
-  const { date, title, startTime, endTime, time, snoozeMinutes, repeat, notes, done } = req.body || {};
+  const { date, title, startTime, endTime, time, snoozeMinutes, repeat, notes, done, priority } = req.body || {};
 
   const updated = {
     ...existing,
     date: date !== undefined ? date : existing.date,
     title: title !== undefined ? String(title).trim() : existing.title,
+    priority: priority !== undefined ? priority : existing.priority,
     startTime: startTime !== undefined ? (startTime === "" || startTime === null ? null : startTime) : existing.startTime,
     endTime: endTime !== undefined ? (endTime === "" || endTime === null ? null : endTime) : existing.endTime,
     time: time !== undefined ? (time === "" || time === null ? null : time) : existing.time,
@@ -973,6 +1011,9 @@ app.put("/api/tasks/:id", requireAuth, asyncRoute(async (req, res) => {
   if (updated.repeat !== "none" && !REPEAT_MODES.has(updated.repeat)) {
     return res.status(400).json({ error: "repeat must be none, daily or weekly" });
   }
+  if (!PRIORITIES.has(updated.priority)) {
+    return res.status(400).json({ error: "priority must be low, medium or high" });
+  }
 
   updated.reminders = remindersForTask(updated.time, updated.startTime, updated.endTime, updated.snoozeMinutes);
   tasks[idx] = updated;
@@ -984,6 +1025,39 @@ app.delete("/api/tasks/:id", requireAuth, asyncRoute(async (req, res) => {
   const { id } = req.params;
   const tasks = await readTasks();
   const next = tasks.filter((t) => !(t.id === id && t.owner === req.user.id));
+  if (next.length === tasks.length) {
+    return res.status(404).json({ error: "task not found" });
+  }
+  await writeTasks(next);
+  res.status(204).end();
+}));
+
+// Delete a repeating series ("all days"): removes the chosen instance and every
+// other copy of the same daily/weekly run from this date forwards. Past days
+// keep their history; the "this day only" case is handled by the route above.
+app.delete("/api/tasks/series/:id", requireAuth, asyncRoute(async (req, res) => {
+  const { id } = req.params;
+  const tasks = await readTasks();
+  const target = tasks.find((t) => t.id === id && t.owner === req.user.id);
+  if (!target) return res.status(404).json({ error: "task not found" });
+
+  const sameSeries = (t) => {
+    if (t.owner !== req.user.id) return false;
+    // New repeating tasks share a seriesId; older ones (created before this
+    // feature) fall back to matching by repeat rule + title + schedule.
+    if (target.seriesId) return t.seriesId === target.seriesId;
+    return (
+      t.repeat === target.repeat &&
+      t.title === target.title &&
+      (t.time || null) === (target.time || null) &&
+      (t.startTime || null) === (target.startTime || null) &&
+      (t.endTime || null) === (target.endTime || null) &&
+      Number(t.snoozeMinutes || 0) === Number(target.snoozeMinutes || 0)
+    );
+  };
+
+  // Dates are zero-padded YYYY-MM-DD, so plain string ordering is chronological.
+  const next = tasks.filter((t) => !(sameSeries(t) && String(t.date || "") >= String(target.date || "")));
   if (next.length === tasks.length) {
     return res.status(404).json({ error: "task not found" });
   }

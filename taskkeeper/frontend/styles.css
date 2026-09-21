@@ -9,6 +9,9 @@
   --amber: #C98A3A;
   --amber-dim: #F5E7D2;
   --danger: #B4483B;
+  --prio-green: #3E9E4D;
+  --prio-yellow: #D9A514;
+  --prio-red: #C63B2B;
   --radius: 10px;
   --serif: "Fraunces", Georgia, serif;
   --sans: "Inter", system-ui, sans-serif;
@@ -435,6 +438,64 @@ body {
   font-style: italic;
   font-size: 15px;
 }
+
+/* ---------- Priority dots (green / yellow / red) ---------- */
+
+.priority-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  vertical-align: middle;
+}
+.priority-dot.low { background: var(--prio-green); }
+.priority-dot.medium { background: var(--prio-yellow); }
+.priority-dot.high { background: var(--prio-red); }
+
+/* Agenda: put the priority dot on the same line as the task name. */
+.agenda-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.agenda-title-row h3 {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agenda-title-row .priority-dot { flex-shrink: 0; }
+
+/* ---------- Repeating-task delete confirmation ---------- */
+
+.confirm-overlay { z-index: 70; }
+.confirm-text {
+  margin: 0 0 16px;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--ink);
+}
+.confirm-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.danger-btn {
+  background: var(--danger);
+  color: #fff;
+  border: none;
+  border-radius: 7px;
+  padding: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: var(--sans);
+}
+.danger-btn:hover { background: #96392E; }
+.confirm-actions .secondary-btn { width: 100%; }
 
 /* ---------- Toasts ---------- */
 

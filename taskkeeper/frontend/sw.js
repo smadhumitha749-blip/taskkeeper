@@ -54,6 +54,22 @@ self.addEventListener("fetch", (event) => {
 });
 
 // ---------- Push notifications ----------
+// Coloured-circle emojis render natively on phone and desktop lock screens, so
+// the priority shows as a real green/yellow/red dot next to the task name and
+// time in the OS notification.
+const PRIORITY_INFO = {
+  low: { label: "Low", dot: "\u{1F7E2}" },
+  medium: { label: "Medium", dot: "\u{1F7E1}" },
+  high: { label: "High", dot: "\u{1F534}" },
+};
+
+function to12h(hhmm) {
+  if (!hhmm || !String(hhmm).includes(":")) return hhmm || "";
+  const [h, m] = hhmm.split(":").map(Number);
+  const period = h >= 12 ? "PM" : "AM";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:${String(m).padStart(2, "0")} ${period}`;
+}
 
 self.addEventListener("push", (event) => {
   let data = {};
@@ -64,9 +80,18 @@ self.addEventListener("push", (event) => {
   }
   const payload = data.payload || data;
 
-  const title = payload.title || "Dayline reminder";
+  const priority = PRIORITY_INFO[payload.priority] || PRIORITY_INFO.medium;
+  const title = `${priority.dot} ${payload.title || "Dayline reminder"}`;
+  const timeText = payload.time
+    ? to12h(payload.time)
+    : payload.startTime && payload.endTime
+      ? `${to12h(payload.startTime)}–${to12h(payload.endTime)}`
+      : "Anytime";
+  const body = payload.body && !payload.priority
+    ? payload.body
+    : `${priority.label} · ${timeText}${payload.time ? ` · Reminder for ${to12h(payload.time)}` : ""}`;
   const options = {
-    body: payload.body || "You have a task right now.",
+    body,
     tag: payload.tag || new Date(Date.now()).toISOString(),
     icon: payload.icon || "./icons/icon-192.png",
     badge: "./icons/icon-192.png",
